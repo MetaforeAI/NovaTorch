@@ -53,6 +53,7 @@ set(NOVATORCH_SOURCES
     csrc/bridge/nova_ops_comparison.cpp
     csrc/bridge/nova_ops_loss.cpp
     csrc/bridge/nova_ops_inplace.cpp
+    csrc/bridge/nova_ops_extra.cpp
     csrc/bridge/nova_pipeline_cache.cpp
     csrc/bridge/nova_descriptor_pool.cpp
     csrc/bindings/module.cpp

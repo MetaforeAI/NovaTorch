@@ -295,6 +295,30 @@ at::Tensor& nova_softmax_out(
 at::Tensor& nova_log_softmax_out(
     const at::Tensor& self, int64_t dim, bool half_to_float, at::Tensor& out);
 
+// Extra ops (nova_ops_extra.cpp)
+at::Tensor nova_embedding(
+    const at::Tensor& weight, const at::Tensor& indices,
+    int64_t padding_idx, bool scale_grad_by_freq, bool sparse);
+at::Tensor nova_embedding_dense_backward(
+    const at::Tensor& grad_output, const at::Tensor& indices,
+    int64_t num_weights, int64_t padding_idx, bool scale_grad_by_freq);
+at::Tensor nova_arange(
+    const at::Scalar& start, const at::Scalar& end, const at::Scalar& step,
+    std::optional<at::ScalarType> dtype, std::optional<at::Layout> layout,
+    std::optional<at::Device> device, std::optional<bool> pin_memory);
+at::Tensor& nova_arange_out(
+    const at::Scalar& start, const at::Scalar& end, const at::Scalar& step,
+    at::Tensor& out);
+std::tuple<at::Tensor, at::Tensor> nova_native_dropout(
+    const at::Tensor& input, double p, std::optional<bool> train);
+at::Tensor& nova_bernoulli_float(
+    at::Tensor& self, double p, std::optional<at::Generator> gen);
+at::Tensor nova_nonzero(const at::Tensor& self);
+at::Tensor nova_scaled_dot_product_attention(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const std::optional<at::Tensor>& attn_mask, double dropout_p,
+    bool is_causal, std::optional<double> scale, bool enable_gqa);
+
 // Backward ops (nova_ops_loss.cpp)
 at::Tensor& nova_nll_loss_backward_grad_input(
     const at::Tensor& grad_output, const at::Tensor& self,
@@ -534,4 +558,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // Cat ops
     m.impl("cat", nova_cat);
     m.impl("cat.out", nova_cat_out);
+
+    // Extra ops
+    m.impl("embedding", nova_embedding);
+    m.impl("embedding_dense_backward", nova_embedding_dense_backward);
+    m.impl("arange.start_step", nova_arange);
+    m.impl("arange.start_out", nova_arange_out);
+    m.impl("native_dropout", nova_native_dropout);
+    m.impl("bernoulli_.float", nova_bernoulli_float);
+    m.impl("nonzero", nova_nonzero);
+    m.impl("scaled_dot_product_attention", nova_scaled_dot_product_attention);
 }
