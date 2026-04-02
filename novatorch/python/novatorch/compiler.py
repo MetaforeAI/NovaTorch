@@ -11,6 +11,7 @@ Usage:
 import torch
 from torch._dynamo.backends.registry import register_backend
 from torch._dynamo.backends.common import aot_autograd
+from functorch.compile import make_boxed_func
 
 
 # ---------------------------------------------------------------------------
@@ -32,5 +33,9 @@ def nova(gm: torch.fx.GraphModule, example_inputs):
 # graphs automatically. Both forward and backward are compiled FX graphs
 # dispatched through our registered ops.
 
-nova_aot = aot_autograd(fw_compiler=nova)
+def _nova_aot_compiler(gm: torch.fx.GraphModule, example_inputs):
+    """Compile a Core ATen FX graph for Nova execution."""
+    return make_boxed_func(gm.forward)
+
+nova_aot = aot_autograd(fw_compiler=_nova_aot_compiler)
 register_backend(nova_aot, name="nova_aot")

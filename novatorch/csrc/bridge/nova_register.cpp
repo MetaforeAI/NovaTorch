@@ -78,6 +78,8 @@ at::Tensor nova_contiguous(
 at::Tensor nova_clone(
     const at::Tensor& self, std::optional<c10::MemoryFormat> memory_format);
 at::Tensor nova_detach(const at::Tensor& self);
+at::Tensor nova_alias(const at::Tensor& self);
+at::Tensor nova_unsafe_view(const at::Tensor& self, c10::SymIntArrayRef size);
 
 // Factory / utility ops (nova_ops_factory.cpp)
 at::Tensor nova_zeros_like(
@@ -121,6 +123,14 @@ at::Tensor nova_copy_from(
 at::Tensor nova_copy_from_and_resize(
     const at::Tensor& self, const at::Tensor& dst);
 at::Scalar nova_local_scalar_dense(const at::Tensor& self);
+at::Tensor nova_to_copy(
+    const at::Tensor& self,
+    std::optional<c10::ScalarType> dtype,
+    std::optional<c10::Layout> layout,
+    std::optional<c10::Device> device,
+    std::optional<bool> pin_memory,
+    bool non_blocking,
+    std::optional<c10::MemoryFormat> memory_format);
 
 // In-place ops (nova_ops_inplace.cpp)
 at::Tensor& nova_copy_inplace(
@@ -483,6 +493,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     // Registering it on PrivateUse1 triggers a spurious autograd warning.
     m.impl("clone", nova_clone);
     m.impl("detach", nova_detach);
+    m.impl("alias", nova_alias);
+    m.impl("_unsafe_view", nova_unsafe_view);
 
     // Factory / utility ops
     m.impl("zeros_like", nova_zeros_like);
@@ -496,6 +508,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("_copy_from", nova_copy_from);
     m.impl("_copy_from_and_resize", nova_copy_from_and_resize);
     m.impl("_local_scalar_dense", nova_local_scalar_dense);
+    m.impl("_to_copy", nova_to_copy);
 
     // In-place ops
     m.impl("copy_", nova_copy_inplace);

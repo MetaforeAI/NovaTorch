@@ -693,6 +693,29 @@ at::Tensor nova_detach(const at::Tensor& self) {
         self, self.sizes(), self.strides(), self.storage_offset());
 }
 
+// ---------------------------------------------------------------------------
+// alias  --  identity view (shares storage, preserves autograd)
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_alias(const at::Tensor& self) {
+    return make_view(
+        self, self.sizes(), self.strides(), self.storage_offset());
+}
+
+// ---------------------------------------------------------------------------
+// _unsafe_view  --  view without contiguity check
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_unsafe_view(const at::Tensor& self, c10::SymIntArrayRef size) {
+    // Convert SymInt to concrete int64_t
+    std::vector<int64_t> concrete;
+    concrete.reserve(size.size());
+    for (const auto& s : size) {
+        concrete.push_back(s.expect_int());
+    }
+    return nova_view(self, concrete);
+}
+
 // ===================================================================
 // Factory / utility ops
 // ===================================================================

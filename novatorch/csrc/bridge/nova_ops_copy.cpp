@@ -203,3 +203,72 @@ at::Scalar nova_local_scalar_dense(const at::Tensor& self) {
                 self.scalar_type());
     }
 }
+
+// ---------------------------------------------------------------------------
+// _to_copy — dtype/device conversion (used by AOTAutograd)
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_to_copy(
+    const at::Tensor& self,
+    std::optional<c10::ScalarType> dtype,
+    std::optional<c10::Layout> /*layout*/,
+    std::optional<c10::Device> device,
+    std::optional<bool> /*pin_memory*/,
+    bool /*non_blocking*/,
+    std::optional<c10::MemoryFormat> memory_format) {
+
+    auto target_dtype = dtype.value_or(self.scalar_type());
+    auto target_device = device.value_or(self.device());
+    bool same_dtype = (target_dtype == self.scalar_type());
+    bool self_nova = isNova(self);
+    bool target_nova = (target_device.type() == c10::DeviceType::PrivateUse1);
+
+    // Case 1: Same device, same dtype → clone
+    if (same_dtype && self_nova && target_nova) {
+        auto self_c = self.is_contiguous() ? self : self.contiguous();
+        auto output = at::empty(self_c.sizes(), self_c.options());
+        novatorch::copyDeviceToDevice(self_c, output,
+            self_c.numel() * self_c.element_size());
+        return output;
+    }
+
+    // Case 2: Same device, different dtype → CPU round-trip
+    if (self_nova && target_nova && !same_dtype) {
+        auto self_c = self.is_contiguous() ? self : self.contiguous();
+        size_t src_bytes = self_c.numel() * self_c.element_size();
+        auto cpu_src = at::empty(self_c.sizes(),
+            self_c.options().device(c10::kCPU));
+        novatorch::downloadFromDevice(self_c, cpu_src.data_ptr(), src_bytes);
+        auto cpu_dst = cpu_src.to(target_dtype);
+        auto output = at::empty(cpu_dst.sizes(),
+            cpu_dst.options().device(target_device));
+        novatorch::uploadToDevice(output, cpu_dst.data_ptr(),
+            cpu_dst.numel() * cpu_dst.element_size());
+        return output;
+    }
+
+    // Case 3: Nova → CPU
+    if (self_nova && !target_nova) {
+        auto self_c = self.is_contiguous() ? self : self.contiguous();
+        size_t bytes = self_c.numel() * self_c.element_size();
+        auto cpu_out = at::empty(self_c.sizes(),
+            self_c.options().device(c10::kCPU));
+        novatorch::downloadFromDevice(self_c, cpu_out.data_ptr(), bytes);
+        if (!same_dtype) cpu_out = cpu_out.to(target_dtype);
+        return cpu_out;
+    }
+
+    // Case 4: CPU → Nova
+    if (!self_nova && target_nova) {
+        auto src = same_dtype ? self : self.to(target_dtype);
+        src = src.is_contiguous() ? src : src.contiguous();
+        auto output = at::empty(src.sizes(),
+            src.options().device(target_device));
+        novatorch::uploadToDevice(output, src.data_ptr(),
+            src.numel() * src.element_size());
+        return output;
+    }
+
+    // Case 5: CPU → CPU fallback
+    return self.to(target_dtype);
+}
