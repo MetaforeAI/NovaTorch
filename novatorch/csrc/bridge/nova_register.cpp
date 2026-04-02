@@ -357,6 +357,10 @@ at::Tensor& nova_linalg_vector_norm_out(
     std::optional<at::ScalarType> dtype, at::Tensor& out);
 
 // Index ops (nova_ops_extra.cpp)
+at::Tensor nova_logical_and(
+    const at::Tensor& self, const at::Tensor& other);
+at::Tensor& nova_logical_and_out(
+    const at::Tensor& self, const at::Tensor& other, at::Tensor& out);
 at::Tensor& nova_index_put_impl(
     at::Tensor& self,
     const c10::List<std::optional<at::Tensor>>& indices,
@@ -651,6 +655,10 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("index.Tensor", nova_index_tensor);
     m.impl("index.Tensor_out", nova_index_tensor_out);
     m.impl("_index_put_impl_", nova_index_put_impl);
+
+    // Logical ops
+    m.impl("logical_and", nova_logical_and);
+    m.impl("logical_and.out", nova_logical_and_out);
 }
 
 // ---------------------------------------------------------------------------
