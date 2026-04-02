@@ -275,7 +275,7 @@ void addPlanStep(
     auto it = reg.find(op_name);
     if (it == reg.end()) {
         throw std::runtime_error(
-            "nova_compiled: unsupported op '" + op_name + "'");
+            "nova: unsupported op in compiled graph '" + op_name + "'");
     }
 
     CompiledStep step;

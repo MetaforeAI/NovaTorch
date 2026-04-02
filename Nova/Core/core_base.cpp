@@ -332,6 +332,15 @@ void NovaCore::createLogicalDevice(bool need_swapchain_extension)
     VkPhysicalDeviceFeatures deviceFeatures{};
     deviceFeatures.samplerAnisotropy = VK_TRUE;
 
+    // Vulkan 1.2 features: enable UPDATE_AFTER_BIND for descriptor sets.
+    // This allows command buffer reuse — descriptor set contents can be
+    // updated after recording but before submission.
+    VkPhysicalDeviceVulkan12Features vulkan12Features{};
+    vulkan12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    vulkan12Features.descriptorBindingStorageBufferUpdateAfterBind = VK_TRUE;
+    vulkan12Features.descriptorBindingPartiallyBound = VK_TRUE;
+    vulkan12Features.runtimeDescriptorArray = VK_TRUE;
+
     // Device extensions
     std::vector<const char*> deviceExtensions;
     if (need_swapchain_extension) {
@@ -340,6 +349,7 @@ void NovaCore::createLogicalDevice(bool need_swapchain_extension)
 
     VkDeviceCreateInfo createInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+        .pNext = &vulkan12Features,
         .queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size()),
         .pQueueCreateInfos = queueCreateInfos.data(),
         .enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size()),

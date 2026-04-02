@@ -55,7 +55,7 @@ torch.nova = _nova_mod  # make getattr(torch, "nova") work
 torch.utils.generate_methods_for_privateuse1_backend()
 
 
-# Register torch.compile backends ("nova" and "nova_aot")
+# Register torch.compile backend
 import novatorch.compiler  # noqa: E402,F401
 
 

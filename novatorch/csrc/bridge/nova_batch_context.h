@@ -2,6 +2,7 @@
 
 #include "nova_ops.h"
 #include "nova_descriptor_pool.h"
+#include "nova_pipeline_cache.h"
 #include "nova_context.h"
 #include <nova_compute.h>
 
@@ -9,6 +10,9 @@
 #include <string>
 #include <cstdint>
 #include <unordered_set>
+
+// Forward declaration — full definition in nova_compiled_graph.h
+struct DescriptorMapping;
 
 /// Thread-local batch context for automatic GPU dispatch coalescing.
 ///
@@ -40,6 +44,23 @@ public:
     void setEnabled(bool enabled);
     bool isEnabled() const;
 
+    /// Begin recording into an EXTERNAL command buffer (for capture mode).
+    /// The batch context records dispatches into this cmd buffer instead of
+    /// its own. Call endCapture() when done to stop redirecting.
+    void beginCapture(VkCommandBuffer external_cmd);
+
+    /// Stop capturing. Returns the descriptor pool with all allocated sets.
+    std::unique_ptr<NovaDescriptorPool> endCapture();
+
+    /// Stop capturing and return descriptor→buffer mappings + retained tensors.
+    /// The retained tensors keep all VkBuffers alive that the command buffer references.
+    std::vector<DescriptorMapping> endCaptureWithMap(
+        std::vector<at::Tensor>* out_retained = nullptr);
+
+    /// Swap the descriptor pool used for allocation. Returns the old pool.
+    /// Used during capture to switch to a UAB pool.
+    NovaDescriptorPool* swapDescPool(NovaDescriptorPool* new_pool);
+
 private:
     NovaBatchContext();
 
@@ -61,9 +82,16 @@ private:
     // flush() completes and the GPU is done with the command buffer.
     std::vector<at::Tensor> retained_;
 
-    // Dependency-aware barriers: track which VkBuffers have pending writes
-    // (dispatched but not yet barriered). A dispatch only gets a barrier
-    // if it reads or writes a buffer with a pending write. Independent
-    // dispatches (different buffers) execute concurrently on the GPU.
+    // Dependency-aware barriers
     std::unordered_set<VkBuffer> pending_writes_;
+
+    // Capture mode: record into an external command buffer
+    VkCommandBuffer capture_cmd_ = VK_NULL_HANDLE;
+    bool capturing_ = false;
+
+    // Descriptor tracking during capture
+    std::vector<DescriptorMapping> capture_mappings_;
+
+    // Swappable descriptor pool pointer (for UAB during capture)
+    NovaDescriptorPool* active_desc_pool_ = nullptr;
 };

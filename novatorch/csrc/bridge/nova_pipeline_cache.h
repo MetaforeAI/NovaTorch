@@ -9,9 +9,11 @@
 struct NovaPipelineInfo {
     VkPipeline pipeline;
     VkPipelineLayout layout;
-    VkDescriptorSetLayout desc_layout;
-    uint32_t num_buffers;        // number of storage buffer bindings
-    uint32_t push_constant_size; // size of push constant block in bytes
+    VkDescriptorSetLayout desc_layout;       // normal (eager path)
+    VkDescriptorSetLayout desc_layout_uab;   // UPDATE_AFTER_BIND (compiled path)
+    VkDescriptorUpdateTemplate update_template; // for fast descriptor updates
+    uint32_t num_buffers;
+    uint32_t push_constant_size;
 };
 
 class NovaPipelineCache {
