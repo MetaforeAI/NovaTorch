@@ -208,6 +208,59 @@ at::Tensor& nova_sigmoid_backward_grad_input(
 }
 
 // ---------------------------------------------------------------------------
+// nova_tanh_backward
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_tanh_backward(
+    const at::Tensor& grad_output,
+    const at::Tensor& output) {
+
+    auto grad_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    auto out_c = output.is_contiguous() ? output : output.contiguous();
+
+    TORCH_CHECK(
+        grad_c.scalar_type() == at::ScalarType::Float,
+        "nova_tanh_backward: only float32 supported");
+
+    const auto numel = static_cast<uint32_t>(grad_c.numel());
+    if (numel == 0) return at::empty_like(grad_c);
+
+    auto grad_input = at::empty_like(grad_c);
+
+    auto* alloc_go = novatorch::getNovaAllocation(grad_c);
+    auto* alloc_out = novatorch::getNovaAllocation(out_c);
+    auto* alloc_gi = novatorch::getNovaAllocation(grad_input);
+
+    VkBuffer bufs[3] = {alloc_go->buffer, alloc_out->buffer, alloc_gi->buffer};
+    VkDeviceSize sizes[3] = {
+        static_cast<VkDeviceSize>(alloc_go->size),
+        static_cast<VkDeviceSize>(alloc_out->size),
+        static_cast<VkDeviceSize>(alloc_gi->size)
+    };
+
+    ActivationPC pc{numel};
+
+    constexpr uint32_t WG_SIZE = 256;
+    uint32_t groups = (numel + WG_SIZE - 1) / WG_SIZE;
+
+    dispatchCompute(
+        "tanh_backward", 3, sizeof(pc), &pc, bufs, sizes, groups, 1, 1,
+        {grad_c, out_c, grad_input});
+
+    return grad_input;
+}
+
+at::Tensor& nova_tanh_backward_grad_input(
+    const at::Tensor& grad_output,
+    const at::Tensor& output,
+    at::Tensor& grad_input) {
+    auto result = nova_tanh_backward(grad_output, output);
+    grad_input.resize_as_(result);
+    grad_input.copy_(result);
+    return grad_input;
+}
+
+// ---------------------------------------------------------------------------
 // nova_native_dropout_backward
 // ---------------------------------------------------------------------------
 

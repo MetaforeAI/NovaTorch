@@ -276,6 +276,11 @@ at::Tensor& nova_threshold_backward_out(
     const at::Scalar& threshold, at::Tensor& out);
 at::Tensor nova_sigmoid_backward(
     const at::Tensor& grad_output, const at::Tensor& output);
+at::Tensor nova_tanh_backward(
+    const at::Tensor& grad_output, const at::Tensor& output);
+at::Tensor& nova_tanh_backward_grad_input(
+    const at::Tensor& grad_output, const at::Tensor& output,
+    at::Tensor& grad_input);
 at::Tensor& nova_sigmoid_backward_grad_input(
     const at::Tensor& grad_output, const at::Tensor& output,
     at::Tensor& grad_input);
@@ -584,6 +589,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("threshold_backward.grad_input", nova_threshold_backward_out);
     m.impl("sigmoid_backward", nova_sigmoid_backward);
     m.impl("sigmoid_backward.grad_input", nova_sigmoid_backward_grad_input);
+    m.impl("tanh_backward", nova_tanh_backward);
+    m.impl("tanh_backward.grad_input", nova_tanh_backward_grad_input);
     m.impl("native_dropout_backward", nova_native_dropout_backward);
     m.impl("native_dropout_backward.out", nova_native_dropout_backward_out);
 
