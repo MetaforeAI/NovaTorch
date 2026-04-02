@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <cstdint>
+#include <unordered_set>
 
 /// Thread-local batch context for automatic GPU dispatch coalescing.
 ///
@@ -59,4 +60,10 @@ private:
     // at::Tensor refcount keeps the underlying VkBuffer alive until
     // flush() completes and the GPU is done with the command buffer.
     std::vector<at::Tensor> retained_;
+
+    // Dependency-aware barriers: track which VkBuffers have pending writes
+    // (dispatched but not yet barriered). A dispatch only gets a barrier
+    // if it reads or writes a buffer with a pending write. Independent
+    // dispatches (different buffers) execute concurrently on the GPU.
+    std::unordered_set<VkBuffer> pending_writes_;
 };

@@ -70,54 +70,30 @@ PYBIND11_MODULE(_C, m) {
         "y[t] = dot(C, x[t]) + D * sum(u[:,t,:]). Returns [batch, seq_len, 1].");
 
     // ---------------------------------------------------------------
-    // Compiled graph execution (torch.compile nova_aot backend)
+    // Compiled graph execution (C++ op loop, no Python per op)
     // ---------------------------------------------------------------
 
-    py::class_<NovaCompiledGraph, std::shared_ptr<NovaCompiledGraph>>(m, "NovaCompiledGraph")
+    py::class_<CompiledPlan, std::shared_ptr<CompiledPlan>>(m, "CompiledPlan")
         .def(py::init<>())
-        .def_readwrite("num_inputs", &NovaCompiledGraph::num_inputs)
-        .def_readwrite("num_outputs", &NovaCompiledGraph::num_outputs)
-        .def_readwrite("intermediates", &NovaCompiledGraph::intermediates)
-        .def_readwrite("output_intermediate_indices",
-                       &NovaCompiledGraph::output_intermediate_indices);
+        .def_readwrite("num_inputs", &CompiledPlan::num_inputs)
+        .def_readwrite("num_outputs", &CompiledPlan::num_outputs)
+        .def_readwrite("output_indices", &CompiledPlan::output_indices)
+        .def_readwrite("tensor_table_size", &CompiledPlan::tensor_table_size);
 
-    m.def("add_dispatch_step", [](
-        NovaCompiledGraph& plan,
-        const std::string& kernel_name,
-        uint32_t num_buffers,
-        uint32_t push_constant_size,
-        py::bytes push_data_bytes,
-        std::vector<uint32_t> buffer_indices,
-        std::vector<uint64_t> buffer_sizes,
-        uint32_t groups_x, uint32_t groups_y, uint32_t groups_z
+    m.def("add_op_step", [](
+        CompiledPlan& plan,
+        const std::string& op_name,
+        std::vector<int> input_indices,
+        int output_index,
+        std::vector<double> scalar_args
     ) {
-        NovaDispatchStep step;
-        step.pipeline = &getPipelineCache().get(
-            kernel_name, num_buffers, push_constant_size);
-        std::string pd = push_data_bytes;
-        step.push_data.assign(pd.begin(), pd.end());
-        step.push_constant_size = push_constant_size;
-        step.num_buffers = num_buffers;
-        step.groups_x = groups_x;
-        step.groups_y = groups_y;
-        step.groups_z = groups_z;
-        step.buffer_indices = std::move(buffer_indices);
-        step.buffer_sizes.reserve(buffer_sizes.size());
-        for (auto s : buffer_sizes)
-            step.buffer_sizes.push_back(static_cast<VkDeviceSize>(s));
-        plan.steps.push_back(std::move(step));
-    }, "Add a dispatch step to a compiled graph plan");
+        addPlanStep(plan, op_name, input_indices, output_index, scalar_args);
+    }, "Add a C++ op step to a compiled plan");
 
-    m.def("init_compiled_graph_pool", [](NovaCompiledGraph& plan) {
-        plan.desc_pool = std::make_unique<NovaDescriptorPool>();
-        plan.desc_pool->init(NovaContext::instance().device(),
-                             std::max(1u, static_cast<uint32_t>(plan.steps.size())));
-    }, "Initialize the descriptor pool for a compiled graph");
-
-    m.def("execute_compiled_graph", [](
-        NovaCompiledGraph& plan,
+    m.def("execute_plan", [](
+        CompiledPlan& plan,
         std::vector<at::Tensor> inputs
     ) -> std::vector<at::Tensor> {
-        return executeCompiledGraph(plan, inputs);
-    }, "Execute a compiled graph with given inputs");
+        return executePlan(plan, inputs);
+    }, "Execute a compiled plan with given inputs");
 }

@@ -1,170 +1,332 @@
 #include "nova_compiled_graph.h"
-#include "nova_context.h"
 #include "nova_batch_context.h"
-#include "nova_storage.h"
 
-#include <nova_compute.h>
-#include <unordered_set>
+#include <unordered_map>
+#include <stdexcept>
 
-std::vector<at::Tensor> executeCompiledGraph(
-    NovaCompiledGraph& plan,
+// =========================================================================
+// Forward declarations for all registered C++ ops
+// =========================================================================
+
+// Elementwise
+at::Tensor nova_add_tensor(const at::Tensor&, const at::Tensor&, const at::Scalar&);
+at::Tensor nova_sub_tensor(const at::Tensor&, const at::Tensor&, const at::Scalar&);
+at::Tensor nova_mul_tensor(const at::Tensor&, const at::Tensor&);
+at::Tensor nova_div_tensor(const at::Tensor&, const at::Tensor&);
+at::Tensor nova_neg(const at::Tensor&);
+
+// Matmul
+at::Tensor nova_mm(const at::Tensor&, const at::Tensor&);
+at::Tensor nova_addmm(const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                       const at::Scalar&, const at::Scalar&);
+at::Tensor nova_bmm(const at::Tensor&, const at::Tensor&);
+
+// Activation
+at::Tensor nova_relu(const at::Tensor&);
+at::Tensor nova_sigmoid(const at::Tensor&);
+at::Tensor nova_tanh(const at::Tensor&);
+at::Tensor nova_threshold_backward(const at::Tensor&, const at::Tensor&, const at::Scalar&);
+at::Tensor nova_sigmoid_backward(const at::Tensor&, const at::Tensor&);
+at::Tensor nova_tanh_backward(const at::Tensor&, const at::Tensor&);
+
+// Math
+at::Tensor nova_exp(const at::Tensor&);
+at::Tensor nova_log(const at::Tensor&);
+at::Tensor nova_sqrt(const at::Tensor&);
+at::Tensor nova_rsqrt(const at::Tensor&);
+at::Tensor nova_abs(const at::Tensor&);
+at::Tensor nova_reciprocal(const at::Tensor&);
+
+// Reduction
+at::Tensor nova_sum(const at::Tensor&, std::optional<at::ScalarType>);
+at::Tensor nova_sum_dim_intlist(const at::Tensor&, at::OptionalIntArrayRef, bool, std::optional<at::ScalarType>);
+at::Tensor nova_mean(const at::Tensor&, std::optional<at::ScalarType>);
+at::Tensor nova_mean_dim(const at::Tensor&, at::OptionalIntArrayRef, bool, std::optional<at::ScalarType>);
+
+// View (these call through to PyTorch dispatch, handle contiguize etc.)
+at::Tensor nova_view(const at::Tensor&, c10::IntArrayRef);
+at::Tensor nova_t(const at::Tensor&);
+at::Tensor nova_transpose_int(const at::Tensor&, int64_t, int64_t);
+at::Tensor nova_permute(const at::Tensor&, c10::IntArrayRef);
+at::Tensor nova_view(const at::Tensor&, c10::IntArrayRef);
+at::Tensor nova_unsqueeze(const at::Tensor&, int64_t);
+at::Tensor nova_squeeze_dim(const at::Tensor&, int64_t);
+at::Tensor nova_clone(const at::Tensor&, std::optional<c10::MemoryFormat>);
+at::Tensor nova_detach(const at::Tensor&);
+at::Tensor nova_alias(const at::Tensor&);
+
+// =========================================================================
+// Op registry: maps op name strings to bound C++ functions
+// =========================================================================
+
+using OpFactory = std::function<
+    std::function<at::Tensor(const std::vector<at::Tensor>&)>(
+        const std::vector<double>&)>;
+
+static std::unordered_map<std::string, OpFactory>& getOpRegistry() {
+    static std::unordered_map<std::string, OpFactory> registry;
+    static bool initialized = false;
+    if (initialized) return registry;
+    initialized = true;
+
+    // --- Elementwise ---
+    registry["aten.add.Tensor"] = [](const std::vector<double>& s) {
+        double alpha = s.empty() ? 1.0 : s[0];
+        return [alpha](const std::vector<at::Tensor>& t) {
+            return nova_add_tensor(t[0], t[1], at::Scalar(alpha));
+        };
+    };
+    registry["aten.sub.Tensor"] = [](const std::vector<double>& s) {
+        double alpha = s.empty() ? 1.0 : s[0];
+        return [alpha](const std::vector<at::Tensor>& t) {
+            return nova_sub_tensor(t[0], t[1], at::Scalar(alpha));
+        };
+    };
+    registry["aten.mul.Tensor"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_mul_tensor(t[0], t[1]);
+        };
+    };
+    registry["aten.div.Tensor"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_div_tensor(t[0], t[1]);
+        };
+    };
+    registry["aten.neg.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_neg(t[0]);
+        };
+    };
+
+    // --- Matmul ---
+    registry["aten.mm.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_mm(t[0], t[1]);
+        };
+    };
+    registry["aten.addmm.default"] = [](const std::vector<double>& s) {
+        double beta = s.size() > 0 ? s[0] : 1.0;
+        double alpha = s.size() > 1 ? s[1] : 1.0;
+        return [beta, alpha](const std::vector<at::Tensor>& t) {
+            return nova_addmm(t[0], t[1], t[2], at::Scalar(beta), at::Scalar(alpha));
+        };
+    };
+    registry["aten.bmm.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_bmm(t[0], t[1]);
+        };
+    };
+
+    // --- Activation ---
+    registry["aten.relu.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_relu(t[0]);
+        };
+    };
+    registry["aten.sigmoid.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_sigmoid(t[0]);
+        };
+    };
+    registry["aten.tanh.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_tanh(t[0]);
+        };
+    };
+    registry["aten.threshold_backward.default"] = [](const std::vector<double>& s) {
+        double threshold = s.empty() ? 0.0 : s[0];
+        return [threshold](const std::vector<at::Tensor>& t) {
+            return nova_threshold_backward(t[0], t[1], at::Scalar(threshold));
+        };
+    };
+    registry["aten.sigmoid_backward.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_sigmoid_backward(t[0], t[1]);
+        };
+    };
+    registry["aten.tanh_backward.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_tanh_backward(t[0], t[1]);
+        };
+    };
+
+    // --- Math ---
+    registry["aten.exp.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_exp(t[0]); };
+    };
+    registry["aten.log.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_log(t[0]); };
+    };
+    registry["aten.sqrt.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_sqrt(t[0]); };
+    };
+    registry["aten.rsqrt.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_rsqrt(t[0]); };
+    };
+    registry["aten.abs.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_abs(t[0]); };
+    };
+    registry["aten.reciprocal.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_reciprocal(t[0]); };
+    };
+
+    // --- Reduction ---
+    // sum.dim_IntList: scalar_args = [dim0, dim1, ..., keepdim_flag]
+    // Last value is keepdim (0 or 1). Everything before is dim indices.
+    registry["aten.sum.dim_IntList"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            bool keepdim = false;
+            std::vector<int64_t> dims;
+            if (!s.empty()) {
+                keepdim = (s.back() != 0.0);
+                for (size_t i = 0; i + 1 < s.size(); ++i)
+                    dims.push_back(static_cast<int64_t>(s[i]));
+            }
+            return nova_sum_dim_intlist(t[0],
+                dims.empty() ? at::OptionalIntArrayRef() : at::OptionalIntArrayRef(dims),
+                keepdim, std::nullopt);
+        };
+    };
+    registry["aten.sum.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_sum(t[0], std::nullopt);
+        };
+    };
+    registry["aten.mean.dim"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            bool keepdim = false;
+            std::vector<int64_t> dims;
+            if (!s.empty()) {
+                keepdim = (s.back() != 0.0);
+                for (size_t i = 0; i + 1 < s.size(); ++i)
+                    dims.push_back(static_cast<int64_t>(s[i]));
+            }
+            return nova_mean_dim(t[0],
+                dims.empty() ? at::OptionalIntArrayRef() : at::OptionalIntArrayRef(dims),
+                keepdim, std::nullopt);
+        };
+    };
+
+    // --- View ops (these handle contiguize internally) ---
+    // view.default: scalar_args = shape dimensions
+    registry["aten.view.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            std::vector<int64_t> shape;
+            for (double d : s) shape.push_back(static_cast<int64_t>(d));
+            return nova_view(t[0], shape);
+        };
+    };
+    registry["aten.unsqueeze.default"] = [](const std::vector<double>& s) {
+        int64_t dim = s.empty() ? 0 : static_cast<int64_t>(s[0]);
+        return [dim](const std::vector<at::Tensor>& t) {
+            return nova_unsqueeze(t[0], dim);
+        };
+    };
+    registry["aten.squeeze.dim"] = [](const std::vector<double>& s) {
+        int64_t dim = s.empty() ? 0 : static_cast<int64_t>(s[0]);
+        return [dim](const std::vector<at::Tensor>& t) {
+            return nova_squeeze_dim(t[0], dim);
+        };
+    };
+    registry["aten.transpose.int"] = [](const std::vector<double>& s) {
+        int64_t d0 = s.size() > 0 ? static_cast<int64_t>(s[0]) : 0;
+        int64_t d1 = s.size() > 1 ? static_cast<int64_t>(s[1]) : 1;
+        return [d0, d1](const std::vector<at::Tensor>& t) {
+            return nova_transpose_int(t[0], d0, d1);
+        };
+    };
+    registry["aten.permute.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            std::vector<int64_t> dims;
+            for (double d : s) dims.push_back(static_cast<int64_t>(d));
+            return nova_permute(t[0], dims);
+        };
+    };
+    registry["aten.t.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_t(t[0]); };
+    };
+    registry["aten.clone.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_clone(t[0], std::nullopt);
+        };
+    };
+    registry["aten.detach.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_detach(t[0]); };
+    };
+    registry["aten.alias.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) { return nova_alias(t[0]); };
+    };
+
+    return registry;
+}
+
+// =========================================================================
+// Plan construction
+// =========================================================================
+
+void addPlanStep(
+    CompiledPlan& plan,
+    const std::string& op_name,
+    const std::vector<int>& input_indices,
+    int output_index,
+    const std::vector<double>& scalar_args)
+{
+    auto& reg = getOpRegistry();
+    auto it = reg.find(op_name);
+    if (it == reg.end()) {
+        throw std::runtime_error(
+            "nova_compiled: unsupported op '" + op_name + "'");
+    }
+
+    CompiledStep step;
+    step.op_fn = it->second(scalar_args);
+    step.input_indices = input_indices;
+    step.output_index = output_index;
+    plan.steps.push_back(std::move(step));
+
+    if (output_index >= plan.tensor_table_size)
+        plan.tensor_table_size = output_index + 1;
+}
+
+// =========================================================================
+// Plan execution
+// =========================================================================
+
+std::vector<at::Tensor> executePlan(
+    CompiledPlan& plan,
     const std::vector<at::Tensor>& inputs)
 {
-    // 1. Flush any pending eager-mode dispatches
+    // Tensor table: [inputs | intermediates computed during execution]
+    std::vector<at::Tensor> table(plan.tensor_table_size);
+
+    // Patch inputs
+    for (int i = 0; i < plan.num_inputs && i < static_cast<int>(inputs.size()); ++i) {
+        table[i] = inputs[i];
+    }
+
+    // Execute all ops in C++ — no Python in the loop.
+    // Each op calls dispatchCompute() which records into the batch context.
+    for (auto& step : plan.steps) {
+        std::vector<at::Tensor> args;
+        args.reserve(step.input_indices.size());
+        for (int idx : step.input_indices) {
+            args.push_back(table[idx]);
+        }
+        table[step.output_index] = step.op_fn(args);
+    }
+
+    // Single flush — submits entire command buffer, waits for GPU
     NovaBatchContext::instance().flush();
 
-    // 2. Build buffer table: [input buffers | intermediate buffers]
-    const size_t total_slots = plan.num_inputs + plan.intermediates.size();
-    std::vector<VkBuffer> buffer_table(total_slots);
-
-    for (uint32_t i = 0; i < plan.num_inputs; ++i) {
-        buffer_table[i] = novatorch::getNovaBuffer(inputs[i]);
-    }
-    for (size_t i = 0; i < plan.intermediates.size(); ++i) {
-        buffer_table[plan.num_inputs + i] =
-            novatorch::getNovaBuffer(plan.intermediates[i]);
-    }
-
-    // 3. Get per-thread Vulkan resources
-    auto& compute = NovaContext::instance().compute();
-    auto& res = compute.getThreadResources();
-
-    if (res.fence_submitted) {
-        compute.waitForFence(res.fence);
-        res.fence_submitted = false;
-    }
-
-    VkDevice dev = NovaContext::instance().device();
-    vkResetFences(dev, 1, &res.fence);
-    vkResetCommandBuffer(res.cmd, 0);
-
-    // 4. Reset per-plan descriptor pool
-    plan.desc_pool->reset();
-
-    // 5. Begin command buffer
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(res.cmd, &begin);
-
-    // 6. Dependency-aware dispatch recording
-    //
-    // Track which buffers have pending writes (not yet barriered).
-    // A step needs a barrier IFF it reads a buffer with a pending write.
-    // After a barrier, clear the pending writes for the barriered buffers.
-    //
-    // This allows independent dispatches (different buffers) to execute
-    // concurrently on the GPU's multiple compute units.
-
-    // Set of buffer slots with pending writes (dispatched but not barriered)
-    std::unordered_set<uint32_t> pending_writes;
-
-    for (const auto& step : plan.steps) {
-        // Determine which buffers this step reads vs writes.
-        // Convention: last buffer_index is the output (write).
-        // All others are inputs (reads).
-        uint32_t write_slot = step.buffer_indices.back();
-
-        // Check if any input buffer has a pending write → need barrier
-        bool needs_barrier = false;
-        for (uint32_t i = 0; i + 1 < step.num_buffers; ++i) {
-            uint32_t read_slot = step.buffer_indices[i];
-            if (pending_writes.count(read_slot)) {
-                needs_barrier = true;
-                break;
-            }
-        }
-        // Also check write-after-write: if we're writing to a buffer
-        // that has a pending write, we need a barrier too
-        if (pending_writes.count(write_slot)) {
-            needs_barrier = true;
-        }
-
-        if (needs_barrier) {
-            // Insert barrier for all pending writes that this step depends on.
-            // Use per-buffer barriers for maximum concurrency.
-            std::vector<VkBufferMemoryBarrier> buf_barriers;
-            for (uint32_t i = 0; i < step.num_buffers; ++i) {
-                uint32_t slot = step.buffer_indices[i];
-                if (pending_writes.count(slot)) {
-                    VkBufferMemoryBarrier bb{};
-                    bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                    bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                    bb.dstAccessMask = (i + 1 < step.num_buffers)
-                        ? VK_ACCESS_SHADER_READ_BIT    // input: read
-                        : VK_ACCESS_SHADER_WRITE_BIT;  // output: write
-                    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    bb.buffer = buffer_table[slot];
-                    bb.offset = 0;
-                    bb.size = VK_WHOLE_SIZE;
-                    buf_barriers.push_back(bb);
-                    pending_writes.erase(slot);
-                }
-            }
-            if (!buf_barriers.empty()) {
-                vkCmdPipelineBarrier(res.cmd,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0,
-                    0, nullptr,  // no global memory barriers
-                    static_cast<uint32_t>(buf_barriers.size()),
-                    buf_barriers.data(),
-                    0, nullptr);
-            }
-        }
-
-        // Allocate and update descriptor set
-        VkDescriptorSet desc = plan.desc_pool->allocate(
-            step.pipeline->desc_layout);
-
-        std::vector<VkDescriptorBufferInfo> buf_infos(step.num_buffers);
-        std::vector<VkWriteDescriptorSet> writes(step.num_buffers);
-        for (uint32_t i = 0; i < step.num_buffers; ++i) {
-            buf_infos[i] = {
-                buffer_table[step.buffer_indices[i]],
-                0,
-                step.buffer_sizes[i]
-            };
-            writes[i] = {};
-            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[i].dstSet = desc;
-            writes[i].dstBinding = i;
-            writes[i].descriptorCount = 1;
-            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &buf_infos[i];
-        }
-        vkUpdateDescriptorSets(dev, step.num_buffers, writes.data(),
-                               0, nullptr);
-
-        // Record dispatch
-        vkCmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          step.pipeline->pipeline);
-        vkCmdBindDescriptorSets(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                step.pipeline->layout, 0, 1, &desc,
-                                0, nullptr);
-        if (step.push_constant_size > 0) {
-            vkCmdPushConstants(res.cmd, step.pipeline->layout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                               step.push_constant_size,
-                               step.push_data.data());
-        }
-        vkCmdDispatch(res.cmd, step.groups_x, step.groups_y, step.groups_z);
-
-        // Mark this step's output buffer as having a pending write
-        pending_writes.insert(write_slot);
-    }
-
-    // 7. End + submit + wait
-    vkEndCommandBuffer(res.cmd);
-    compute.submitToQueue(res.cmd, res.fence);
-    compute.waitForFence(res.fence);
-
-    // 8. Return output tensors
+    // Extract outputs (-1 means None — non-differentiable backward input)
     std::vector<at::Tensor> outputs;
-    outputs.reserve(plan.num_outputs);
-    for (uint32_t idx : plan.output_intermediate_indices) {
-        outputs.push_back(plan.intermediates[idx]);
+    outputs.reserve(plan.output_indices.size());
+    for (int idx : plan.output_indices) {
+        if (idx >= 0 && idx < static_cast<int>(table.size())) {
+            outputs.push_back(table[idx]);
+        } else {
+            outputs.push_back(at::Tensor());  // empty/undefined tensor for None
+        }
     }
     return outputs;
 }

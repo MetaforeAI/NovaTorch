@@ -1,51 +1,50 @@
 #pragma once
 
 #include <ATen/ATen.h>
-#include <vulkan/vulkan.h>
-#include "nova_pipeline_cache.h"
-#include "nova_descriptor_pool.h"
-
-#include <cstdint>
-#include <memory>
+#include <functional>
+#include <string>
 #include <vector>
+#include <cstdint>
 
-/// A single dispatch step in a compiled execution plan.
-/// All fields are resolved at compile time and immutable after.
-struct NovaDispatchStep {
-    const NovaPipelineInfo* pipeline;     // stable pointer into pipeline cache
-    std::vector<uint8_t> push_data;       // serialized push constants
-    uint32_t push_constant_size;
-    uint32_t num_buffers;
-    uint32_t groups_x, groups_y, groups_z;
+/// A single step in a compiled execution plan.
+/// Calls a real C++ op function (nova_addmm, nova_relu, etc.) with
+/// tensor arguments resolved from the tensor table.
+struct CompiledStep {
+    /// The op to call. Takes tensor args + scalar args, returns result.
+    /// Pre-bound with any scalar arguments (alpha, beta, etc.) at compile time.
+    std::function<at::Tensor(const std::vector<at::Tensor>&)> op_fn;
 
-    /// Indices into the flat buffer table maintained by executeCompiledGraph.
-    /// Layout: [0..num_inputs-1] = input tensors, [num_inputs..] = intermediates.
-    std::vector<uint32_t> buffer_indices;
-    std::vector<VkDeviceSize> buffer_sizes;
+    /// Indices into the tensor table for this op's inputs.
+    std::vector<int> input_indices;
+
+    /// Where to store the result in the tensor table.
+    int output_index;
 };
 
-/// A compiled execution plan for a full FX graph.
-/// Pre-allocates intermediates, pre-resolves pipelines, replays in one submit.
-struct NovaCompiledGraph {
-    uint32_t num_inputs  = 0;
-    uint32_t num_outputs = 0;
-
-    /// Pre-allocated intermediate tensors (reused across calls).
-    std::vector<at::Tensor> intermediates;
-
-    /// Which intermediates are graph outputs (indices into intermediates).
-    std::vector<uint32_t> output_intermediate_indices;
-
-    /// The dispatch sequence.
-    std::vector<NovaDispatchStep> steps;
-
-    /// Per-plan descriptor pool — sized for steps.size(), reset each call.
-    std::unique_ptr<NovaDescriptorPool> desc_pool;
+/// A compiled execution plan for an FX graph.
+/// Replays a sequence of C++ op calls entirely in C++ without
+/// returning to Python between ops.
+struct CompiledPlan {
+    int num_inputs = 0;
+    int num_outputs = 0;
+    std::vector<int> output_indices;  // which tensor table slots are outputs
+    std::vector<CompiledStep> steps;
+    int tensor_table_size = 0;
 };
 
 /// Execute a compiled plan with the given input tensors.
-/// Records all dispatches into one command buffer, submits once, waits once.
-/// Returns output tensors (views of pre-allocated intermediates).
-std::vector<at::Tensor> executeCompiledGraph(
-    NovaCompiledGraph& plan,
+/// Calls C++ ops in sequence, batch context accumulates dispatches,
+/// flushes once at the end. Returns output tensors.
+std::vector<at::Tensor> executePlan(
+    CompiledPlan& plan,
     const std::vector<at::Tensor>& inputs);
+
+/// Add a step to the plan. The op_name is resolved to a C++ function.
+/// scalar_args contains any non-tensor arguments (alpha, beta, dim, etc.)
+/// serialized as doubles.
+void addPlanStep(
+    CompiledPlan& plan,
+    const std::string& op_name,
+    const std::vector<int>& input_indices,
+    int output_index,
+    const std::vector<double>& scalar_args);

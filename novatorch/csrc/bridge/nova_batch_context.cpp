@@ -67,6 +67,9 @@ void NovaBatchContext::flush() {
     // Release retained tensors — GPU is done, buffers are safe to free
     retained_.clear();
 
+    // Clear pending write tracking for next batch
+    pending_writes_.clear();
+
     recording_ = false;
     dispatch_count_ = 0;
 }
@@ -147,8 +150,58 @@ void NovaBatchContext::recordDispatch(
         NovaContext::instance().device(),
         num_buffers, writes.data(), 0, nullptr);
 
-    // Record into PER-THREAD command buffer (no mutex needed)
     VkCommandBuffer cmd = resources_->cmd;
+
+    // --- Dependency-aware barriers ---
+    // Convention: last buffer is the output (write), others are inputs (reads).
+    // Only insert barriers for buffers this dispatch actually depends on.
+    // Independent dispatches (different buffers) execute concurrently on GPU.
+    VkBuffer write_buf = buffers[num_buffers - 1];
+
+    // Check if any input buffer has a pending write → need barrier
+    std::vector<VkBufferMemoryBarrier> buf_barriers;
+    for (uint32_t i = 0; i + 1 < num_buffers; ++i) {
+        if (pending_writes_.count(buffers[i])) {
+            VkBufferMemoryBarrier bb{};
+            bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.buffer = buffers[i];
+            bb.offset = 0;
+            bb.size = VK_WHOLE_SIZE;
+            buf_barriers.push_back(bb);
+            pending_writes_.erase(buffers[i]);
+        }
+    }
+    // Write-after-write: if output buffer has pending write
+    if (pending_writes_.count(write_buf)) {
+        VkBufferMemoryBarrier bb{};
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = write_buf;
+        bb.offset = 0;
+        bb.size = VK_WHOLE_SIZE;
+        buf_barriers.push_back(bb);
+        pending_writes_.erase(write_buf);
+    }
+
+    if (!buf_barriers.empty()) {
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0, nullptr,
+            static_cast<uint32_t>(buf_barriers.size()),
+            buf_barriers.data(),
+            0, nullptr);
+    }
+
+    // Record dispatch
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pi.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pi.layout, 0, 1, &desc, 0, nullptr);
@@ -157,20 +210,13 @@ void NovaBatchContext::recordDispatch(
                            0, push_constant_size, push_data);
     vkCmdDispatch(cmd, groups_x, groups_y, groups_z);
 
+    // Mark output buffer as having a pending write
+    pending_writes_.insert(write_buf);
+
     // Retain tensors to prevent use-after-free during batch lifetime
     for (const auto& t : retain) {
         retained_.push_back(t);
     }
-
-    // Compute-to-compute barrier between dispatches
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &barrier, 0, nullptr, 0, nullptr);
 
     dispatch_count_++;
 }
