@@ -368,7 +368,10 @@ at::Tensor nova_expand(
     int64_t ndim = static_cast<int64_t>(size.size());
     TORCH_CHECK(
         ndim >= self.dim(),
-        "nova_expand: number of dimensions must be >= self.dim()");
+        "nova_expand: target ndim (", ndim,
+        ") must be >= self.dim() (", self.dim(),
+        "). self.sizes()=", self.sizes(),
+        ", target size=", size);
 
     auto old_sizes = self.sizes();
     auto old_strides = self.strides();
