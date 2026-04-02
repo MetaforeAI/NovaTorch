@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <torch/python.h>
+#include <fstream>
 #include "nova_context.h"
 #include "nova_compute.h"
 #include "nova_allocator.h"
@@ -61,6 +62,51 @@ PYBIND11_MODULE(_C, m) {
     m.def("set_batching", [](bool enabled) {
         NovaBatchContext::instance().setEnabled(enabled);
     }, "Enable/disable automatic command batching");
+
+    // ---------------------------------------------------------------
+    // GPU Profiling
+    // ---------------------------------------------------------------
+
+    m.def("enable_profiling", [](bool enable) {
+        NovaBatchContext::instance().setProfilingEnabled(enable);
+    }, py::arg("enable"), "Enable/disable GPU timestamp profiling");
+
+    m.def("get_profiling_results", []() -> py::list {
+        auto& results = NovaBatchContext::instance().getProfilingResults();
+        py::list out;
+        for (auto& r : results) {
+            py::dict d;
+            d["kernel"] = r.kernel_name;
+            d["gpu_time_ns"] = r.gpu_time_ns;
+            out.append(d);
+        }
+        return out;
+    }, "Get per-dispatch GPU timing from last batch");
+
+    m.def("get_memory_stats", []() -> py::dict {
+        VmaAllocator vma = NovaContext::instance().allocator();
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+        vmaGetHeapBudgets(vma, budgets);
+
+        uint64_t total_allocated = 0, total_used = 0;
+        for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; ++i) {
+            total_allocated += budgets[i].statistics.blockBytes;
+            total_used += budgets[i].statistics.allocationBytes;
+        }
+
+        py::dict result;
+        result["allocated_bytes"] = total_allocated;
+        result["used_bytes"] = total_used;
+        return result;
+    }, "Get GPU memory statistics from VMA");
+
+    m.def("get_gpu_utilization", []() -> int {
+        std::ifstream f("/sys/class/drm/card1/device/gpu_busy_percent");
+        if (!f.is_open()) return -1;
+        int pct = 0;
+        f >> pct;
+        return pct;
+    }, "Get GPU utilization percentage (AMD sysfs)");
 
     // Custom fused ops
     m.def("ssm_scan", &nova_ssm_scan,

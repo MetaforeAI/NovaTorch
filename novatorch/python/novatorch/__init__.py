@@ -131,9 +131,113 @@ def ssm_scan(A_bar, B_bar, u, C, D_val: float):
     return _C.ssm_scan(A_bar, B_bar, u, C, D_val)
 
 
+class profile:
+    """Context manager for GPU profiling with per-kernel timing.
+
+    Usage:
+        with novatorch.profile() as prof:
+            out = model(x)
+            loss.backward()
+        prof.summary()
+    """
+
+    def __enter__(self):
+        _C.flush()
+        _C.enable_profiling(True)
+        self._start_mem = _C.get_memory_stats()
+        self._results = []
+        self._end_mem = {}
+        self._gpu_util = -1
+        return self
+
+    def __exit__(self, *args):
+        _C.flush()
+        self._results = _C.get_profiling_results()
+        self._end_mem = _C.get_memory_stats()
+        self._gpu_util = _C.get_gpu_utilization()
+        _C.enable_profiling(False)
+
+    @property
+    def results(self):
+        return self._results
+
+    def summary(self):
+        """Print formatted profiling summary."""
+        total_ns = sum(r['gpu_time_ns'] for r in self._results)
+        total_ms = total_ns / 1e6
+
+        print(f"Device: {device_name()}")
+        print(f"GPU Utilization: {self._gpu_util}%")
+        mem_alloc = self._end_mem.get('allocated_bytes', 0) / 1e9
+        mem_used = self._end_mem.get('used_bytes', 0) / 1e9
+        print(f"GPU Memory: {mem_used:.2f} GB allocated, {mem_alloc:.2f} GB reserved")
+        print(f"Total GPU time: {total_ms:.2f} ms ({len(self._results)} dispatches)")
+        print()
+
+        # Aggregate by kernel name
+        by_kernel = {}
+        for r in self._results:
+            name = r['kernel']
+            by_kernel[name] = by_kernel.get(name, 0) + r['gpu_time_ns']
+
+        print("Top kernels:")
+        for name, ns in sorted(by_kernel.items(), key=lambda x: -x[1]):
+            ms = ns / 1e6
+            pct = 100 * ns / total_ns if total_ns > 0 else 0
+            print(f"  {name:30s} {ms:8.2f} ms  ({pct:5.1f}%)")
+
+
+def benchmark(fn, warmup: int = 5, iterations: int = 100):
+    """Benchmark a callable with GPU timing.
+
+    Args:
+        fn: callable to benchmark
+        warmup: number of warmup iterations (not timed)
+        iterations: number of timed iterations
+
+    Returns:
+        dict with min_ms, mean_ms, std_ms, gpu_times_ms
+    """
+    import math
+
+    # Warmup
+    for _ in range(warmup):
+        fn()
+        _C.flush()
+
+    # Timed runs
+    _C.enable_profiling(True)
+    gpu_times = []
+    for _ in range(iterations):
+        fn()
+        _C.flush()
+        results = _C.get_profiling_results()
+        total_ns = sum(r['gpu_time_ns'] for r in results)
+        gpu_times.append(total_ns / 1e6)  # ms
+    _C.enable_profiling(False)
+
+    mean = sum(gpu_times) / len(gpu_times)
+    variance = sum((t - mean) ** 2 for t in gpu_times) / len(gpu_times)
+    std = math.sqrt(variance)
+    min_t = min(gpu_times)
+    max_t = max(gpu_times)
+
+    print(f"Benchmark ({iterations} iterations, {warmup} warmup):")
+    print(f"  min: {min_t:.3f} ms  mean: {mean:.3f} ms  std: {std:.3f} ms  max: {max_t:.3f} ms")
+
+    return {
+        "min_ms": min_t,
+        "mean_ms": mean,
+        "std_ms": std,
+        "max_ms": max_t,
+        "gpu_times_ms": gpu_times,
+    }
+
+
 __version__ = "0.1.0"
 __all__ = [
     "is_available", "device_count", "device_name",
     "synchronize", "set_log_level", "reset_descriptor_pool",
     "flush", "set_batching", "ssm_scan",
+    "profile", "benchmark",
 ]

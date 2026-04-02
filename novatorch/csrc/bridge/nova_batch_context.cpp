@@ -38,10 +38,29 @@ void NovaBatchContext::beginBatch() {
     vkResetFences(dev, 1, &resources_->fence);
     vkResetCommandBuffer(resources_->cmd, 0);
 
+    // Profiling: create query pool on first use, reset for new batch
+    if (profiling_enabled_) {
+        if (query_pool_ == VK_NULL_HANDLE) {
+            max_queries_ = 2048;
+            VkQueryPoolCreateInfo qci{};
+            qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = max_queries_;
+            vkCreateQueryPool(dev, &qci, nullptr, &query_pool_);
+        }
+        query_count_ = 0;
+        dispatch_names_.clear();
+    }
+
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(resources_->cmd, &begin);
+
+    // Reset query pool inside command buffer (must be after begin)
+    if (profiling_enabled_ && query_pool_ != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(resources_->cmd, query_pool_, 0, max_queries_);
+    }
 
     recording_ = true;
     dispatch_count_ = 0;
@@ -61,6 +80,31 @@ void NovaBatchContext::flush() {
     // Wait for GPU completion on this thread (no mutex held)
     compute.waitForFence(resources_->fence);
     resources_->fence_submitted = false;
+
+    // Collect profiling timestamps (GPU is done, results are ready)
+    if (profiling_enabled_ && query_count_ > 0 && query_pool_ != VK_NULL_HANDLE) {
+        VkDevice dev = NovaContext::instance().device();
+        std::vector<uint64_t> timestamps(query_count_);
+        vkGetQueryPoolResults(dev, query_pool_, 0, query_count_,
+            query_count_ * sizeof(uint64_t), timestamps.data(),
+            sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(
+            NovaContext::instance().compute().getPhysicalDevice(), &props);
+        float period = props.limits.timestampPeriod;
+
+        profiling_results_.clear();
+        for (uint32_t i = 0; i < dispatch_names_.size(); ++i) {
+            uint64_t start = timestamps[i * 2];
+            uint64_t end = timestamps[i * 2 + 1];
+            profiling_results_.push_back({
+                dispatch_names_[i],
+                static_cast<uint64_t>((end - start) * period)
+            });
+        }
+    }
 
     // Reset descriptor pool for next batch
     desc_pool_->reset();
@@ -209,14 +253,28 @@ void NovaBatchContext::recordDispatch(
             0, nullptr);
     }
 
-    // Record dispatch
+    // Record dispatch (with optional profiling timestamps)
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pi.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pi.layout, 0, 1, &desc, 0, nullptr);
     if (push_constant_size > 0)
         vkCmdPushConstants(cmd, pi.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, push_constant_size, push_data);
+
+    if (profiling_enabled_ && query_pool_ != VK_NULL_HANDLE &&
+        query_count_ + 2 <= max_queries_) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            query_pool_, query_count_++);
+    }
+
     vkCmdDispatch(cmd, groups_x, groups_y, groups_z);
+
+    if (profiling_enabled_ && query_pool_ != VK_NULL_HANDLE &&
+        query_count_ < max_queries_) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            query_pool_, query_count_++);
+        dispatch_names_.push_back(kernel_name);
+    }
 
     // Mark output buffer as having a pending write
     pending_writes_.insert(write_buf);
@@ -259,6 +317,22 @@ void NovaBatchContext::setEnabled(bool enabled) {
 
 bool NovaBatchContext::isEnabled() const {
     return enabled_;
+}
+
+void NovaBatchContext::setProfilingEnabled(bool enable) {
+    profiling_enabled_ = enable;
+    if (!enable) {
+        // Destroy query pool when profiling disabled
+        if (query_pool_ != VK_NULL_HANDLE) {
+            VkDevice dev = NovaContext::instance().device();
+            vkDestroyQueryPool(dev, query_pool_, nullptr);
+            query_pool_ = VK_NULL_HANDLE;
+            max_queries_ = 0;
+        }
+        query_count_ = 0;
+        dispatch_names_.clear();
+        profiling_results_.clear();
+    }
 }
 
 // -------------------------------------------------------------------------

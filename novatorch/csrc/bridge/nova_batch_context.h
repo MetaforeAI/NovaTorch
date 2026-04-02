@@ -44,6 +44,19 @@ public:
     void setEnabled(bool enabled);
     bool isEnabled() const;
 
+    // --- GPU Profiling ---
+
+    void setProfilingEnabled(bool enable);
+    bool isProfilingEnabled() const { return profiling_enabled_; }
+
+    struct DispatchTiming {
+        std::string kernel_name;
+        uint64_t gpu_time_ns;
+    };
+    const std::vector<DispatchTiming>& getProfilingResults() const {
+        return profiling_results_;
+    }
+
     /// Begin recording into an EXTERNAL command buffer (for capture mode).
     /// The batch context records dispatches into this cmd buffer instead of
     /// its own. Call endCapture() when done to stop redirecting.
@@ -94,4 +107,12 @@ private:
 
     // Swappable descriptor pool pointer (for UAB during capture)
     NovaDescriptorPool* active_desc_pool_ = nullptr;
+
+    // --- GPU Profiling state (zero overhead when disabled) ---
+    bool profiling_enabled_ = false;
+    VkQueryPool query_pool_ = VK_NULL_HANDLE;
+    uint32_t query_count_ = 0;
+    uint32_t max_queries_ = 0;
+    std::vector<std::string> dispatch_names_;
+    std::vector<DispatchTiming> profiling_results_;
 };
