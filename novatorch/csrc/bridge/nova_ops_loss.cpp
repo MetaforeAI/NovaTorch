@@ -75,10 +75,6 @@ at::Tensor nova_softmax(
     uint32_t outer_size, dim_size, inner_size;
     compute_softmax_dims(self, dim, outer_size, dim_size, inner_size);
 
-    TORCH_CHECK(dim_size <= WG_SIZE,
-        "nova_softmax: dim_size (", dim_size,
-        ") must be <= ", WG_SIZE, " for initial implementation");
-
     auto output = at::empty_like(self);
 
     auto* alloc_in  = novatorch::getNovaAllocation(self);
@@ -121,10 +117,6 @@ at::Tensor nova_log_softmax(
 
     uint32_t outer_size, dim_size, inner_size;
     compute_softmax_dims(self, dim, outer_size, dim_size, inner_size);
-
-    TORCH_CHECK(dim_size <= WG_SIZE,
-        "nova_log_softmax: dim_size (", dim_size,
-        ") must be <= ", WG_SIZE, " for initial implementation");
 
     auto output = at::empty_like(self);
 
