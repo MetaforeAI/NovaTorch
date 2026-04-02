@@ -1,0 +1,86 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Buffers:
+//   0: A_bar    [state_dim]                  — constant decay
+//   1: B_bar    [batch, seq_len, state_dim]  — input weight per step
+//   2: u        [batch, seq_len, state_dim]  — input sequence
+//   3: C        [state_dim]                  — output projection
+//   4: x_buf    [batch, state_dim]           — hidden state (read/write)
+//   5: y        [batch, seq_len, 1]          — output (written)
+
+layout(set = 0, binding = 0) readonly  buffer ABuf  { float A_bar[]; };
+layout(set = 0, binding = 1) readonly  buffer BBuf  { float B_bar[]; };
+layout(set = 0, binding = 2) readonly  buffer UBuf  { float u[];     };
+layout(set = 0, binding = 3) readonly  buffer CBuf  { float C[];     };
+layout(set = 0, binding = 4)           buffer XBuf  { float x_buf[]; };
+layout(set = 0, binding = 5) writeonly buffer YBuf  { float y[];     };
+
+layout(push_constant) uniform PC {
+    uint batch_size;
+    uint seq_len;
+    uint state_dim;
+    float D_val;
+};
+
+// Shared memory for reductions
+shared float shared_cx[256];
+shared float shared_u_sum[256];
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    if (b >= batch_size) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+
+    // x_buf[b, :] is the hidden state for batch element b.
+    // Initialized to zero by the caller.
+    uint x_base = b * state_dim;
+
+    // Sequential scan over time
+    for (uint t = 0; t < seq_len; t++) {
+        uint bt_offset = (b * seq_len + t) * state_dim;
+
+        // Phase 1: Update hidden state (parallel across state_dim)
+        // Also accumulate dot(C, x) and sum(u_t) for output
+        float local_cx = 0.0;
+        float local_u = 0.0;
+
+        for (uint d = tid; d < state_dim; d += wg_size) {
+            float a_val = A_bar[d];
+            float b_val = B_bar[bt_offset + d];
+            float u_val = u[bt_offset + d];
+            float c_val = C[d];
+
+            // Update state
+            float new_x = a_val * x_buf[x_base + d] + b_val * u_val;
+            x_buf[x_base + d] = new_x;
+
+            // Accumulate for output
+            local_cx += c_val * new_x;
+            local_u  += u_val;
+        }
+
+        // Phase 2: Parallel reduction
+        shared_cx[tid] = local_cx;
+        shared_u_sum[tid] = local_u;
+        barrier();
+
+        for (uint stride = wg_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                shared_cx[tid]    += shared_cx[tid + stride];
+                shared_u_sum[tid] += shared_u_sum[tid + stride];
+            }
+            barrier();
+        }
+
+        // Phase 3: Thread 0 writes output
+        if (tid == 0) {
+            y[b * seq_len + t] = shared_cx[0] + D_val * shared_u_sum[0];
+        }
+
+        barrier();
+    }
+}

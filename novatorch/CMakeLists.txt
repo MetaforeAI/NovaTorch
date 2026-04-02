@@ -84,6 +84,7 @@ target_include_directories(novatorch_C PRIVATE
 target_link_libraries(novatorch_C PRIVATE
     Nova
     ${TORCH_LIBRARIES}
+    torch_python
     Vulkan::Vulkan
     Python3::Module
 )

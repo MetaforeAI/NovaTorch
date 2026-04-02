@@ -930,7 +930,90 @@ at::Tensor& nova_index_put_impl(
 }
 
 // ===================================================================
-// 12. logical_and — elementwise boolean AND
+// 12. nova_ssm_scan — fused SSM scan (Mamba-style)
+// ===================================================================
+//
+// Replaces the sequential Python loop:
+//   for t in range(seq_len):
+//       x = A_bar * x + B_bar * u[:, t, :]
+//       y = dot(C, x) + D * sum(u[:, t, :])
+//
+// One workgroup per batch element, threads parallelize across state_dim.
+// Sequential scan over seq_len with shared-memory reductions per step.
+
+at::Tensor nova_ssm_scan(
+    const at::Tensor& A_bar,    // [state_dim]
+    const at::Tensor& B_bar,    // [batch, seq_len, state_dim]
+    const at::Tensor& u,        // [batch, seq_len, state_dim]
+    const at::Tensor& C,        // [state_dim]
+    double D_val) {
+
+    TORCH_CHECK(A_bar.dim() == 1, "nova_ssm_scan: A_bar must be 1-D");
+    TORCH_CHECK(B_bar.dim() == 3, "nova_ssm_scan: B_bar must be 3-D [batch, seq_len, state_dim]");
+    TORCH_CHECK(u.dim() == 3, "nova_ssm_scan: u must be 3-D [batch, seq_len, state_dim]");
+    TORCH_CHECK(C.dim() == 1, "nova_ssm_scan: C must be 1-D");
+
+    auto A_c = A_bar.contiguous();
+    auto B_c = B_bar.contiguous();
+    auto u_c = u.contiguous();
+    auto C_c = C.contiguous();
+
+    int64_t batch_size = B_c.size(0);
+    int64_t seq_len    = B_c.size(1);
+    int64_t state_dim  = B_c.size(2);
+
+    TORCH_CHECK(A_c.size(0) == state_dim, "nova_ssm_scan: A_bar size must match state_dim");
+    TORCH_CHECK(C_c.size(0) == state_dim, "nova_ssm_scan: C size must match state_dim");
+    TORCH_CHECK(u_c.size(0) == batch_size && u_c.size(1) == seq_len && u_c.size(2) == state_dim,
+        "nova_ssm_scan: u shape must match B_bar");
+    auto output = at::empty({batch_size, seq_len, 1}, B_c.options());
+
+    // Hidden state buffer — initialized to zero, updated in-place by shader
+    auto x_buf = at::zeros({batch_size, state_dim}, B_c.options());
+
+    auto* alloc_A = novatorch::getNovaAllocation(A_c);
+    auto* alloc_B = novatorch::getNovaAllocation(B_c);
+    auto* alloc_u = novatorch::getNovaAllocation(u_c);
+    auto* alloc_C = novatorch::getNovaAllocation(C_c);
+    auto* alloc_x = novatorch::getNovaAllocation(x_buf);
+    auto* alloc_y = novatorch::getNovaAllocation(output);
+
+    VkBuffer bufs[6] = {
+        alloc_A->buffer, alloc_B->buffer, alloc_u->buffer,
+        alloc_C->buffer, alloc_x->buffer, alloc_y->buffer
+    };
+    VkDeviceSize sizes[6] = {
+        static_cast<VkDeviceSize>(alloc_A->size),
+        static_cast<VkDeviceSize>(alloc_B->size),
+        static_cast<VkDeviceSize>(alloc_u->size),
+        static_cast<VkDeviceSize>(alloc_C->size),
+        static_cast<VkDeviceSize>(alloc_x->size),
+        static_cast<VkDeviceSize>(alloc_y->size)
+    };
+
+    struct {
+        uint32_t batch_size;
+        uint32_t seq_len;
+        uint32_t state_dim;
+        float D_val;
+    } pc{
+        static_cast<uint32_t>(batch_size),
+        static_cast<uint32_t>(seq_len),
+        static_cast<uint32_t>(state_dim),
+        static_cast<float>(D_val)
+    };
+
+    // One workgroup per batch element
+    dispatchCompute(
+        "ssm_scan", 6, sizeof(pc), &pc, bufs, sizes,
+        static_cast<uint32_t>(batch_size), 1, 1,
+        {A_c, B_c, u_c, C_c, x_buf, output});
+
+    return output;
+}
+
+// ===================================================================
+// 13. logical_and — elementwise boolean AND
 // ===================================================================
 
 at::Tensor nova_logical_and(

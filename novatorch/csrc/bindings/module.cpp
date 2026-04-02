@@ -1,9 +1,15 @@
 #include <torch/extension.h>
+#include <torch/python.h>
 #include "nova_context.h"
 #include "nova_compute.h"
 #include "nova_allocator.h"
 #include "nova_ops.h"
 #include "nova_batch_context.h"
+
+// Forward declaration for custom fused ops
+at::Tensor nova_ssm_scan(
+    const at::Tensor& A_bar, const at::Tensor& B_bar,
+    const at::Tensor& u, const at::Tensor& C, double D_val);
 
 namespace py = pybind11;
 
@@ -54,4 +60,11 @@ PYBIND11_MODULE(_C, m) {
     m.def("set_batching", [](bool enabled) {
         NovaBatchContext::instance().setEnabled(enabled);
     }, "Enable/disable automatic command batching");
+
+    // Custom fused ops
+    m.def("ssm_scan", &nova_ssm_scan,
+        py::arg("A_bar"), py::arg("B_bar"), py::arg("u"),
+        py::arg("C"), py::arg("D_val"),
+        "Fused SSM scan: x[t] = A_bar * x[t-1] + B_bar[:,t,:] * u[:,t,:], "
+        "y[t] = dot(C, x[t]) + D * sum(u[:,t,:]). Returns [batch, seq_len, 1].");
 }

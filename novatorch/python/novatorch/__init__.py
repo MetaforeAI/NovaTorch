@@ -100,9 +100,29 @@ def set_batching(enabled: bool = True):
     _C.set_batching(enabled)
 
 
+def ssm_scan(A_bar, B_bar, u, C, D_val: float):
+    """Fused SSM scan — replaces sequential Python loop with single GPU dispatch.
+
+    For each timestep t:
+        x[t] = A_bar * x[t-1] + B_bar[:, t, :] * u[:, t, :]
+        y[t] = dot(C, x[t]) + D_val * sum(u[:, t, :])
+
+    Args:
+        A_bar: [state_dim] — constant decay factor
+        B_bar: [batch, seq_len, state_dim] — input weight per step
+        u:     [batch, seq_len, state_dim] — input sequence
+        C:     [state_dim] — output projection
+        D_val: scalar skip connection weight
+
+    Returns:
+        y: [batch, seq_len, 1] — output at every timestep
+    """
+    return _C.ssm_scan(A_bar, B_bar, u, C, D_val)
+
+
 __version__ = "0.1.0"
 __all__ = [
     "is_available", "device_count", "device_name",
     "synchronize", "set_log_level", "reset_descriptor_pool",
-    "flush", "set_batching",
+    "flush", "set_batching", "ssm_scan",
 ]
