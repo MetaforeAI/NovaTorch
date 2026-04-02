@@ -468,7 +468,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("select.int", nova_select_int);
     m.impl("unsqueeze", nova_unsqueeze);
     m.impl("squeeze.dim", nova_squeeze_dim);
-    m.impl("contiguous", nova_contiguous);
+    // contiguous: NOT registered — PyTorch's default handles it via clone.
+    // Registering it on PrivateUse1 triggers a spurious autograd warning.
     m.impl("clone", nova_clone);
     m.impl("detach", nova_detach);
 
