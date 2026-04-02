@@ -23,6 +23,14 @@ uint32_t divRoundUp(uint32_t n, uint32_t d) {
     return (n + d - 1) / d;
 }
 
+/// Ensure a tensor is on the Nova device. If it's CPU, move it.
+/// This handles the rsub/rtruediv case where PyTorch wraps a scalar
+/// as a CPU tensor and dispatches to our PrivateUse1 kernel.
+at::Tensor ensureNova(const at::Tensor& t) {
+    if (t.device().type() == c10::DeviceType::PrivateUse1) return t;
+    return t.to(c10::Device(c10::DeviceType::PrivateUse1, 0));
+}
+
 } // anonymous namespace
 
 // Forward declarations for scalar variants (defined below)
@@ -38,16 +46,19 @@ at::Tensor nova_add_tensor(
     const at::Tensor& other,
     const at::Scalar& alpha)
 {
+    auto self_n = ensureNova(self);
+    auto other_n = ensureNova(other);
+
     // Scalar broadcast: use add.Scalar path
-    if (other.numel() == 1) {
-        return nova_add_scalar(self, other.item(), alpha);
+    if (other_n.numel() == 1) {
+        return nova_add_scalar(self_n, other_n.item(), alpha);
     }
-    if (self.numel() == 1) {
-        return nova_add_scalar(other, self.item(), alpha);
+    if (self_n.numel() == 1) {
+        return nova_add_scalar(other_n, self_n.item(), alpha);
     }
 
-    auto self_c = self.is_contiguous() ? self : self.contiguous();
-    auto other_c = other.is_contiguous() ? other : other.contiguous();
+    auto self_c = self_n.is_contiguous() ? self_n : self_n.contiguous();
+    auto other_c = other_n.is_contiguous() ? other_n : other_n.contiguous();
 
     auto out_sizes = at::infer_size(self_c.sizes(), other_c.sizes());
     if (self_c.sizes() != out_sizes)
@@ -82,14 +93,26 @@ at::Tensor nova_sub_tensor(
     const at::Tensor& other,
     const at::Scalar& alpha)
 {
+    auto self_n = ensureNova(self);
+    auto other_n = ensureNova(other);
+
     // Scalar broadcast
-    if (other.numel() == 1) {
-        float val = alpha.toFloat() * other.item<float>();
-        return nova_add_scalar(self, at::Scalar(-val), at::Scalar(1.0));
+    if (other_n.numel() == 1) {
+        float val = alpha.toFloat() * other_n.item<float>();
+        return nova_add_scalar(self_n, at::Scalar(-val), at::Scalar(1.0));
+    }
+    if (self_n.numel() == 1) {
+        // scalar - alpha*tensor = -alpha*tensor + scalar
+        float s = self_n.item<float>();
+        // nova_add_scalar(t, other_scalar, alpha) = t + alpha * other_scalar
+        // We want: (-alpha)*tensor + s
+        // = nova_mul_scalar(tensor, -alpha) then nova_add_scalar(result, s, 1)
+        auto neg_scaled = nova_mul_scalar(other_n, at::Scalar(-alpha.toFloat()));
+        return nova_add_scalar(neg_scaled, at::Scalar(s), at::Scalar(1.0));
     }
 
-    auto self_c = self.is_contiguous() ? self : self.contiguous();
-    auto other_c = other.is_contiguous() ? other : other.contiguous();
+    auto self_c = self_n.is_contiguous() ? self_n : self_n.contiguous();
+    auto other_c = other_n.is_contiguous() ? other_n : other_n.contiguous();
 
     auto out_sizes = at::infer_size(self_c.sizes(), other_c.sizes());
     if (self_c.sizes() != out_sizes)
@@ -123,16 +146,18 @@ at::Tensor nova_mul_tensor(
     const at::Tensor& self,
     const at::Tensor& other)
 {
-    // Short-circuit: if either operand is a scalar (numel==1), use mul_scalar
-    if (other.numel() == 1) {
-        return nova_mul_scalar(self, other.item());
+    auto self_n = ensureNova(self);
+    auto other_n = ensureNova(other);
+
+    if (other_n.numel() == 1) {
+        return nova_mul_scalar(self_n, other_n.item());
     }
-    if (self.numel() == 1) {
-        return nova_mul_scalar(other, self.item());
+    if (self_n.numel() == 1) {
+        return nova_mul_scalar(other_n, self_n.item());
     }
 
-    auto self_c = self.is_contiguous() ? self : self.contiguous();
-    auto other_c = other.is_contiguous() ? other : other.contiguous();
+    auto self_c = self_n.is_contiguous() ? self_n : self_n.contiguous();
+    auto other_c = other_n.is_contiguous() ? other_n : other_n.contiguous();
 
     auto out_sizes = at::infer_size(self_c.sizes(), other_c.sizes());
 
@@ -167,17 +192,19 @@ at::Tensor nova_div_tensor(
     const at::Tensor& self,
     const at::Tensor& other)
 {
-    // Scalar broadcast: div by scalar = mul by 1/scalar
-    if (other.numel() == 1) {
-        float val = other.item<float>();
-        return nova_mul_scalar(self, at::Scalar(1.0f / val));
+    auto self_n = ensureNova(self);
+    auto other_n = ensureNova(other);
+
+    if (other_n.numel() == 1) {
+        float val = other_n.item<float>();
+        return nova_mul_scalar(self_n, at::Scalar(1.0f / val));
     }
-    if (self.numel() == 1) {
+    if (self_n.numel() == 1) {
         // scalar / tensor — not easily optimized, fall through to expand
     }
 
-    auto self_c = self.is_contiguous() ? self : self.contiguous();
-    auto other_c = other.is_contiguous() ? other : other.contiguous();
+    auto self_c = self_n.is_contiguous() ? self_n : self_n.contiguous();
+    auto other_c = other_n.is_contiguous() ? other_n : other_n.contiguous();
 
     auto out_sizes = at::infer_size(self_c.sizes(), other_c.sizes());
     if (self_c.sizes() != out_sizes)
