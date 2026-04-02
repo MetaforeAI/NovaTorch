@@ -246,10 +246,22 @@ at::Tensor nova_add_scalar(
     const at::Scalar& other,
     const at::Scalar& alpha)
 {
-    // self + alpha * other (both scalars)
+    // self + alpha * other — implemented directly via mapped memory
+    auto self_c = self.is_contiguous() ? self : self.contiguous();
+    auto output = at::empty(self_c.sizes(), self_c.options());
+    int64_t n = output.numel();
+    if (n == 0) return output;
+
     float val = alpha.toFloat() * other.toFloat();
-    auto other_tensor = at::full_like(self, val);
-    return nova_add_tensor(self, other_tensor, at::Scalar(1.0));
+    novatorch::invalidateNovaBuffer(self_c);
+    const float* src = static_cast<const float*>(
+        novatorch::getNovaAllocation(self_c)->mapped_ptr);
+    float* dst = static_cast<float*>(
+        novatorch::getNovaAllocation(output)->mapped_ptr);
+    for (int64_t i = 0; i < n; ++i)
+        dst[i] = src[i] + val;
+    novatorch::flushNovaBuffer(output);
+    return output;
 }
 
 // ---------------------------------------------------------------------------
