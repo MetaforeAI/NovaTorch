@@ -279,6 +279,11 @@ at::Tensor nova_sigmoid_backward(
 at::Tensor& nova_sigmoid_backward_grad_input(
     const at::Tensor& grad_output, const at::Tensor& output,
     at::Tensor& grad_input);
+at::Tensor nova_native_dropout_backward(
+    const at::Tensor& grad_output, const at::Tensor& mask, double scale);
+at::Tensor& nova_native_dropout_backward_out(
+    const at::Tensor& grad_output, const at::Tensor& mask, double scale,
+    at::Tensor& out);
 
 // Comparison .out (nova_ops_comparison.cpp)
 at::Tensor& nova_eq_scalar_out(
@@ -573,6 +578,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("threshold_backward.grad_input", nova_threshold_backward_out);
     m.impl("sigmoid_backward", nova_sigmoid_backward);
     m.impl("sigmoid_backward.grad_input", nova_sigmoid_backward_grad_input);
+    m.impl("native_dropout_backward", nova_native_dropout_backward);
+    m.impl("native_dropout_backward.out", nova_native_dropout_backward_out);
 
     // Comparison .out
     m.impl("eq.Scalar_out", nova_eq_scalar_out);

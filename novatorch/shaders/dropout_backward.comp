@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer GradOutput { float grad_output[]; };
+layout(set = 0, binding = 1) readonly buffer Mask { uint mask_data[]; };
+layout(set = 0, binding = 2) writeonly buffer GradInput { float grad_input[]; };
+
+layout(push_constant) uniform PC {
+    uint numel;
+    float scale;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numel) return;
+
+    // Mask is stored as bool (1 byte per element).
+    // Pack 4 bools per uint32. Extract the relevant byte.
+    uint word = mask_data[idx / 4];
+    uint byte_val = (word >> (8 * (idx % 4))) & 0xFF;
+
+    grad_input[idx] = (byte_val != 0) ? grad_output[idx] * scale : 0.0;
+}

@@ -13,10 +13,16 @@ struct ThresholdBackwardPC {
     float threshold;
 };
 
+struct DropoutBackwardPC {
+    uint32_t numel;
+    float scale;
+};
+
 static_assert(sizeof(ActivationPC) == 4, "ActivationPC must be 4 bytes");
 static_assert(
     sizeof(ThresholdBackwardPC) == 8,
     "ThresholdBackwardPC must be 8 bytes");
+static_assert(sizeof(DropoutBackwardPC) == 8, "DropoutBackwardPC must be 8 bytes");
 
 // ---------------------------------------------------------------------------
 // Shared helper -- elementwise 2-buffer activation dispatch
@@ -199,6 +205,64 @@ at::Tensor& nova_sigmoid_backward_grad_input(
     grad_input.resize_as_(result);
     grad_input.copy_(result);
     return grad_input;
+}
+
+// ---------------------------------------------------------------------------
+// nova_native_dropout_backward
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_native_dropout_backward(
+    const at::Tensor& grad_output,
+    const at::Tensor& mask,
+    double scale) {
+
+    auto grad_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    auto mask_c = mask.is_contiguous() ? mask : mask.contiguous();
+
+    TORCH_CHECK(
+        grad_c.scalar_type() == at::ScalarType::Float,
+        "nova_native_dropout_backward: only float32 grad supported");
+    TORCH_CHECK(
+        mask_c.scalar_type() == at::ScalarType::Bool,
+        "nova_native_dropout_backward: mask must be bool");
+
+    const auto numel = static_cast<uint32_t>(grad_c.numel());
+    if (numel == 0) return at::empty_like(grad_c);
+
+    auto grad_input = at::empty_like(grad_c);
+
+    auto* alloc_go = novatorch::getNovaAllocation(grad_c);
+    auto* alloc_mask = novatorch::getNovaAllocation(mask_c);
+    auto* alloc_gi = novatorch::getNovaAllocation(grad_input);
+
+    VkBuffer bufs[3] = {alloc_go->buffer, alloc_mask->buffer, alloc_gi->buffer};
+    VkDeviceSize sizes[3] = {
+        static_cast<VkDeviceSize>(alloc_go->size),
+        static_cast<VkDeviceSize>(alloc_mask->size),
+        static_cast<VkDeviceSize>(alloc_gi->size)
+    };
+
+    DropoutBackwardPC pc{numel, static_cast<float>(scale)};
+
+    constexpr uint32_t WG_SIZE = 256;
+    uint32_t groups = (numel + WG_SIZE - 1) / WG_SIZE;
+
+    dispatchCompute(
+        "dropout_backward", 3, sizeof(pc), &pc, bufs, sizes, groups, 1, 1,
+        {grad_c, mask_c, grad_input});
+
+    return grad_input;
+}
+
+at::Tensor& nova_native_dropout_backward_out(
+    const at::Tensor& grad_output,
+    const at::Tensor& mask,
+    double scale,
+    at::Tensor& out) {
+    auto result = nova_native_dropout_backward(grad_output, mask, scale);
+    out.resize_as_(result);
+    out.copy_(result);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
