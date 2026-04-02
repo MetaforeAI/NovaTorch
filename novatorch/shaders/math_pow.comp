@@ -14,5 +14,27 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= numel) return;
 
-    out_data[idx] = pow(a[idx], exponent);
+    float base = a[idx];
+
+    // GLSL pow(x, y) is undefined for x < 0 (uses exp(y*log(x)) → NaN).
+    // Handle negative base correctly:
+    //   - For integer exponents: |base|^exp * sign(base)^exp
+    //   - For non-integer exponents with negative base: NaN (mathematically correct)
+    if (base < 0.0) {
+        float abs_result = exp(exponent * log(-base));
+        // Check if exponent is integer (even → positive, odd → negative)
+        float rounded = round(exponent);
+        if (abs(exponent - rounded) < 1e-6) {
+            // Integer exponent
+            int iexp = int(rounded);
+            out_data[idx] = ((iexp & 1) == 0) ? abs_result : -abs_result;
+        } else {
+            // Non-integer exponent with negative base → NaN
+            out_data[idx] = 0.0 / 0.0;
+        }
+    } else if (base == 0.0) {
+        out_data[idx] = (exponent == 0.0) ? 1.0 : 0.0;
+    } else {
+        out_data[idx] = exp(exponent * log(base));
+    }
 }

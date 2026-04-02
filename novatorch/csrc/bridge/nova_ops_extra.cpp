@@ -1078,3 +1078,44 @@ at::Tensor& nova_logical_and_out(
     out.copy_(result);
     return out;
 }
+
+// ===================================================================
+// 14. random_ — fill tensor with random integers
+// ===================================================================
+
+at::Tensor& nova_random_from(
+    at::Tensor& self, int64_t from, std::optional<int64_t> to_opt,
+    std::optional<at::Generator> /*gen*/) {
+
+    int64_t to = to_opt.value_or(0);
+    if (!to_opt.has_value()) {
+        // Default: full range for dtype
+        if (self.scalar_type() == at::ScalarType::Long)
+            to = std::numeric_limits<int64_t>::max();
+        else if (self.scalar_type() == at::ScalarType::Int)
+            to = std::numeric_limits<int32_t>::max();
+        else
+            to = static_cast<int64_t>(1) << 24; // float mantissa bits
+    }
+
+    novatorch::withStagingWrite(self, [&](void* ptr, size_t nbytes) {
+        std::mt19937_64 rng(std::random_device{}());
+        std::uniform_int_distribution<int64_t> dist(from, to - 1);
+        int64_t n = self.numel();
+
+        if (self.scalar_type() == at::ScalarType::Long) {
+            auto* p = static_cast<int64_t*>(ptr);
+            for (int64_t i = 0; i < n; ++i) p[i] = dist(rng);
+        } else if (self.scalar_type() == at::ScalarType::Int) {
+            auto* p = static_cast<int32_t*>(ptr);
+            for (int64_t i = 0; i < n; ++i) p[i] = static_cast<int32_t>(dist(rng));
+        } else if (self.scalar_type() == at::ScalarType::Float) {
+            auto* p = static_cast<float*>(ptr);
+            for (int64_t i = 0; i < n; ++i) p[i] = static_cast<float>(dist(rng));
+        } else if (self.scalar_type() == at::ScalarType::Double) {
+            auto* p = static_cast<double*>(ptr);
+            for (int64_t i = 0; i < n; ++i) p[i] = static_cast<double>(dist(rng));
+        }
+    });
+    return self;
+}

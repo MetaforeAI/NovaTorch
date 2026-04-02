@@ -368,6 +368,9 @@ at::Tensor& nova_linalg_vector_norm_out(
 
 // Index ops (nova_ops_extra.cpp)
 at::Tensor nova_isnan(const at::Tensor& self);
+at::Tensor& nova_random_from(
+    at::Tensor& self, int64_t from, std::optional<int64_t> to,
+    std::optional<at::Generator> gen);
 at::Tensor nova_any(const at::Tensor& self);
 at::Tensor& nova_any_all_out(const at::Tensor& self, at::Tensor& out);
 at::Tensor nova_logical_and(
@@ -672,8 +675,9 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("index.Tensor_out", nova_index_tensor_out);
     m.impl("_index_put_impl_", nova_index_put_impl);
 
-    // isnan / any
+    // isnan / any / random
     m.impl("isnan", nova_isnan);
+    m.impl("random_.from", nova_random_from);
     m.impl("any", nova_any);
     m.impl("any.all_out", nova_any_all_out);
 
