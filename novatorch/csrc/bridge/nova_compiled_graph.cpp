@@ -4,6 +4,7 @@
 #include "nova_storage.h"
 
 #include <nova_compute.h>
+#include <unordered_set>
 
 std::vector<at::Tensor> executeCompiledGraph(
     NovaCompiledGraph& plan,
@@ -37,7 +38,7 @@ std::vector<at::Tensor> executeCompiledGraph(
     vkResetFences(dev, 1, &res.fence);
     vkResetCommandBuffer(res.cmd, 0);
 
-    // 4. Reset per-plan descriptor pool (safe — fence confirmed GPU done)
+    // 4. Reset per-plan descriptor pool
     plan.desc_pool->reset();
 
     // 5. Begin command buffer
@@ -46,18 +47,77 @@ std::vector<at::Tensor> executeCompiledGraph(
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(res.cmd, &begin);
 
-    // 6. Record all dispatches
-    VkMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    // 6. Dependency-aware dispatch recording
+    //
+    // Track which buffers have pending writes (not yet barriered).
+    // A step needs a barrier IFF it reads a buffer with a pending write.
+    // After a barrier, clear the pending writes for the barriered buffers.
+    //
+    // This allows independent dispatches (different buffers) to execute
+    // concurrently on the GPU's multiple compute units.
+
+    // Set of buffer slots with pending writes (dispatched but not barriered)
+    std::unordered_set<uint32_t> pending_writes;
 
     for (const auto& step : plan.steps) {
-        // Allocate descriptor set from per-plan pool
+        // Determine which buffers this step reads vs writes.
+        // Convention: last buffer_index is the output (write).
+        // All others are inputs (reads).
+        uint32_t write_slot = step.buffer_indices.back();
+
+        // Check if any input buffer has a pending write → need barrier
+        bool needs_barrier = false;
+        for (uint32_t i = 0; i + 1 < step.num_buffers; ++i) {
+            uint32_t read_slot = step.buffer_indices[i];
+            if (pending_writes.count(read_slot)) {
+                needs_barrier = true;
+                break;
+            }
+        }
+        // Also check write-after-write: if we're writing to a buffer
+        // that has a pending write, we need a barrier too
+        if (pending_writes.count(write_slot)) {
+            needs_barrier = true;
+        }
+
+        if (needs_barrier) {
+            // Insert barrier for all pending writes that this step depends on.
+            // Use per-buffer barriers for maximum concurrency.
+            std::vector<VkBufferMemoryBarrier> buf_barriers;
+            for (uint32_t i = 0; i < step.num_buffers; ++i) {
+                uint32_t slot = step.buffer_indices[i];
+                if (pending_writes.count(slot)) {
+                    VkBufferMemoryBarrier bb{};
+                    bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                    bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    bb.dstAccessMask = (i + 1 < step.num_buffers)
+                        ? VK_ACCESS_SHADER_READ_BIT    // input: read
+                        : VK_ACCESS_SHADER_WRITE_BIT;  // output: write
+                    bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bb.buffer = buffer_table[slot];
+                    bb.offset = 0;
+                    bb.size = VK_WHOLE_SIZE;
+                    buf_barriers.push_back(bb);
+                    pending_writes.erase(slot);
+                }
+            }
+            if (!buf_barriers.empty()) {
+                vkCmdPipelineBarrier(res.cmd,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    0, nullptr,  // no global memory barriers
+                    static_cast<uint32_t>(buf_barriers.size()),
+                    buf_barriers.data(),
+                    0, nullptr);
+            }
+        }
+
+        // Allocate and update descriptor set
         VkDescriptorSet desc = plan.desc_pool->allocate(
             step.pipeline->desc_layout);
 
-        // Update descriptors with current buffer handles
         std::vector<VkDescriptorBufferInfo> buf_infos(step.num_buffers);
         std::vector<VkWriteDescriptorSet> writes(step.num_buffers);
         for (uint32_t i = 0; i < step.num_buffers; ++i) {
@@ -91,11 +151,8 @@ std::vector<at::Tensor> executeCompiledGraph(
         }
         vkCmdDispatch(res.cmd, step.groups_x, step.groups_y, step.groups_z);
 
-        // Barrier between dispatches
-        vkCmdPipelineBarrier(res.cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &barrier, 0, nullptr, 0, nullptr);
+        // Mark this step's output buffer as having a pending write
+        pending_writes.insert(write_slot);
     }
 
     // 7. End + submit + wait
