@@ -1,5 +1,6 @@
 #include "nova_ops.h"
 #include "nova_storage.h"
+#include "nova_batch_context.h"
 
 #include <cstring>
 #include <cmath>
@@ -616,4 +617,68 @@ at::Tensor nova_scaled_dot_product_attention(
     });
 
     return output;
+}
+
+// ===================================================================
+// 8. index.Tensor — advanced integer/boolean indexing
+// ===================================================================
+
+at::Tensor nova_index_tensor(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices) {
+
+    // Delegate to CPU: download self + index tensors, run CPU index,
+    // upload result. Advanced indexing is complex (broadcasting,
+    // multi-dim, bool masks) — correct CPU fallback first.
+    NovaBatchContext::instance().flush();
+
+    // Download self to CPU
+    auto self_cpu = at::empty(self.sizes(),
+        self.options().device(c10::Device(c10::DeviceType::CPU)));
+    novatorch::downloadFromDevice(self, self_cpu.data_ptr(),
+        self.numel() * self.element_size());
+
+    // Download each index tensor to CPU
+    c10::List<std::optional<at::Tensor>> cpu_indices;
+    cpu_indices.reserve(indices.size());
+    for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+        std::optional<at::Tensor> idx_opt =
+            static_cast<std::optional<at::Tensor>>(indices.get(i));
+        if (idx_opt.has_value() && idx_opt->defined()) {
+            auto idx = *idx_opt;
+            if (idx.device().type() == c10::DeviceType::PrivateUse1) {
+                auto idx_cpu = at::empty(idx.sizes(),
+                    idx.options().device(c10::Device(c10::DeviceType::CPU)));
+                novatorch::downloadFromDevice(idx, idx_cpu.data_ptr(),
+                    idx.numel() * idx.element_size());
+                cpu_indices.push_back(idx_cpu);
+            } else {
+                cpu_indices.push_back(idx);
+            }
+        } else {
+            cpu_indices.push_back(std::optional<at::Tensor>());
+        }
+    }
+
+    // Run index on CPU
+    auto result_cpu = at::index(self_cpu, cpu_indices);
+
+    // Upload result to Nova
+    auto result = at::empty(result_cpu.sizes(),
+        result_cpu.options().device(self.device()));
+    novatorch::uploadToDevice(result, result_cpu.contiguous().data_ptr(),
+        result_cpu.numel() * result_cpu.element_size());
+
+    return result;
+}
+
+at::Tensor& nova_index_tensor_out(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    at::Tensor& out) {
+    auto result = nova_index_tensor(self, indices);
+    out.resize_as_(result);
+    novatorch::copyDeviceToDevice(result, out,
+        result.numel() * result.element_size());
+    return out;
 }

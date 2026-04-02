@@ -320,6 +320,15 @@ at::Tensor nova_scaled_dot_product_attention(
     const std::optional<at::Tensor>& attn_mask, double dropout_p,
     bool is_causal, std::optional<double> scale, bool enable_gqa);
 
+// Index ops (nova_ops_extra.cpp)
+at::Tensor nova_index_tensor(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices);
+at::Tensor& nova_index_tensor_out(
+    const at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    at::Tensor& out);
+
 // Backward ops (nova_ops_loss.cpp)
 at::Tensor& nova_nll_loss_backward_grad_input(
     const at::Tensor& grad_output, const at::Tensor& self,
@@ -570,4 +579,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("bernoulli_.float", nova_bernoulli_float);
     m.impl("nonzero", nova_nonzero);
     m.impl("scaled_dot_product_attention", nova_scaled_dot_product_attention);
+
+    // Index ops
+    m.impl("index.Tensor", nova_index_tensor);
+    m.impl("index.Tensor_out", nova_index_tensor_out);
 }
