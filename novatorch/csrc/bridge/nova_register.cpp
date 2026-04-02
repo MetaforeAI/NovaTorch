@@ -366,6 +366,12 @@ at::Tensor& nova_nll_loss_backward_grad_input(
     const at::Tensor& target, const std::optional<at::Tensor>& weight,
     int64_t reduction, int64_t ignore_index, const at::Tensor& total_weight,
     at::Tensor& grad_input);
+at::Tensor nova_softmax_backward_data(
+    const at::Tensor& grad_output, const at::Tensor& output,
+    int64_t dim, at::ScalarType input_dtype);
+at::Tensor& nova_softmax_backward_data_out(
+    const at::Tensor& grad_output, const at::Tensor& output,
+    int64_t dim, at::ScalarType input_dtype, at::Tensor& grad_input);
 at::Tensor nova_log_softmax_backward_data(
     const at::Tensor& grad_output, const at::Tensor& output,
     int64_t dim, at::ScalarType input_dtype);
@@ -596,6 +602,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 
     // Backward ops
     m.impl("nll_loss_backward.grad_input", nova_nll_loss_backward_grad_input);
+    m.impl("_softmax_backward_data", nova_softmax_backward_data);
+    m.impl("_softmax_backward_data.out", nova_softmax_backward_data_out);
     m.impl("_log_softmax_backward_data", nova_log_softmax_backward_data);
 
     // Reduction dim variants + .out

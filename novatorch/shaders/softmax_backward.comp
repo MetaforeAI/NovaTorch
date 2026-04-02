@@ -1,0 +1,49 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer GradOutput { float grad_output[]; };
+layout(set = 0, binding = 1) readonly buffer SoftOut { float soft_out[]; };
+layout(set = 0, binding = 2) writeonly buffer GradInput { float grad_input[]; };
+
+layout(push_constant) uniform PC {
+    uint num_rows;
+    uint row_size;
+};
+
+// Each workgroup handles one row.
+// grad_input[i] = output[i] * (grad_output[i] - dot(grad_output, output))
+
+shared float shared_dot[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= num_rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * row_size;
+
+    // Phase 1: compute dot(grad_output, output) for this row
+    float local_dot = 0.0;
+    for (uint i = tid; i < row_size; i += 256) {
+        local_dot += grad_output[base + i] * soft_out[base + i];
+    }
+    shared_dot[tid] = local_dot;
+    barrier();
+
+    // Reduce within workgroup
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_dot[tid] += shared_dot[tid + stride];
+        }
+        barrier();
+    }
+
+    float dot_val = shared_dot[0];
+
+    // Phase 2: compute grad_input
+    for (uint i = tid; i < row_size; i += 256) {
+        uint idx = base + i;
+        grad_input[idx] = soft_out[idx] * (grad_output[idx] - dot_val);
+    }
+}

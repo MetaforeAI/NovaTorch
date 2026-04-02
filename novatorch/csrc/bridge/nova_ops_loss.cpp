@@ -404,3 +404,94 @@ at::Tensor& nova_log_softmax_out(
     out.copy_(result);
     return out;
 }
+
+// ---------------------------------------------------------------------------
+// _softmax_backward_data — GPU shader
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_softmax_backward_data(
+    const at::Tensor& grad_output,
+    const at::Tensor& output,
+    int64_t dim,
+    at::ScalarType input_dtype) {
+
+    auto grad_c = grad_output.is_contiguous() ? grad_output : grad_output.contiguous();
+    auto out_c = output.is_contiguous() ? output : output.contiguous();
+
+    TORCH_CHECK(grad_c.scalar_type() == at::ScalarType::Float,
+        "nova_softmax_backward: only float32 supported");
+
+    // Normalize dim
+    int64_t ndim = grad_c.dim();
+    if (dim < 0) dim += ndim;
+    TORCH_CHECK(dim >= 0 && dim < ndim, "nova_softmax_backward: invalid dim");
+
+    // For the GPU shader, we need dim to be the last dimension.
+    // If it's not, permute so that dim is last, make contiguous, dispatch, permute back.
+    bool need_permute = (dim != ndim - 1);
+    at::Tensor g = grad_c;
+    at::Tensor o = out_c;
+
+    if (need_permute) {
+        std::vector<int64_t> perm;
+        for (int64_t i = 0; i < ndim; ++i)
+            if (i != dim) perm.push_back(i);
+        perm.push_back(dim);
+        g = g.permute(perm).contiguous();
+        o = o.permute(perm).contiguous();
+    }
+
+    // Now last dim is the softmax dim
+    int64_t row_size = g.size(ndim - 1);
+    int64_t num_rows = g.numel() / row_size;
+
+    auto grad_input = at::empty_like(g);
+
+    auto* alloc_go = novatorch::getNovaAllocation(g);
+    auto* alloc_out = novatorch::getNovaAllocation(o);
+    auto* alloc_gi = novatorch::getNovaAllocation(grad_input);
+
+    VkBuffer bufs[3] = {alloc_go->buffer, alloc_out->buffer, alloc_gi->buffer};
+    VkDeviceSize sizes[3] = {
+        static_cast<VkDeviceSize>(alloc_go->size),
+        static_cast<VkDeviceSize>(alloc_out->size),
+        static_cast<VkDeviceSize>(alloc_gi->size)
+    };
+
+    struct { uint32_t num_rows; uint32_t row_size; } pc{
+        static_cast<uint32_t>(num_rows),
+        static_cast<uint32_t>(row_size)
+    };
+
+    // One workgroup per row
+    dispatchCompute(
+        "softmax_backward", 3, sizeof(pc), &pc, bufs, sizes,
+        static_cast<uint32_t>(num_rows), 1, 1,
+        {g, o, grad_input});
+
+    if (need_permute) {
+        // Inverse permute
+        std::vector<int64_t> inv_perm(ndim);
+        std::vector<int64_t> perm;
+        for (int64_t i = 0; i < ndim; ++i)
+            if (i != dim) perm.push_back(i);
+        perm.push_back(dim);
+        for (int64_t i = 0; i < ndim; ++i)
+            inv_perm[perm[i]] = i;
+        grad_input = grad_input.permute(inv_perm).contiguous();
+    }
+
+    return grad_input;
+}
+
+at::Tensor& nova_softmax_backward_data_out(
+    const at::Tensor& grad_output,
+    const at::Tensor& output,
+    int64_t dim,
+    at::ScalarType input_dtype,
+    at::Tensor& grad_input) {
+    auto result = nova_softmax_backward_data(grad_output, output, dim, input_dtype);
+    grad_input.resize_as_(result);
+    grad_input.copy_(result);
+    return grad_input;
+}
