@@ -404,6 +404,18 @@ static std::unordered_map<std::string, OpFactory>& getOpRegistry() {
         };
     };
 
+    // --- Dropout forward ---
+    registry["aten.native_dropout.default"] = [](const std::vector<double>& s) {
+        double p = s.size() > 0 ? s[0] : 0.5;
+        bool train = s.size() > 1 ? (s[1] != 0.0) : true;
+        return [p, train](const std::vector<at::Tensor>& t) -> at::Tensor {
+            auto [output, mask] = at::native_dropout(t[0], p, train);
+            // TODO: multi-output support — for now return output only
+            // The mask is needed for backward but lost here
+            return output;
+        };
+    };
+
     // --- Embedding ---
     registry["aten.embedding.default"] = [](const std::vector<double>& s) {
         // scalar_args: [padding_idx, scale_grad_by_freq, sparse]
