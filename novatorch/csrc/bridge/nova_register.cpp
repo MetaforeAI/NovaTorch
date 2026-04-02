@@ -1,5 +1,6 @@
 #include "nova_context.h"
 #include "nova_allocator.h"
+#include "nova_staging_pool.h"
 #include "nova_guard.h"
 #include "nova_hooks.h"
 #include "nova_ops.h"
@@ -356,20 +357,21 @@ namespace {
 
 struct NovaBackendInit {
     NovaBackendInit() {
-        // 0. Force-construct the allocator singleton FIRST.
+        // 0. Force-construct singletons in the correct destruction order.
         //    Meyer's singletons are destroyed in reverse construction order.
-        //    By constructing NovaAllocator before NovaContext, the allocator
-        //    will be destroyed AFTER the context. This is critical because
-        //    ~NovaContext() calls NovaAllocator::releaseAll() to free all
-        //    live VMA allocations before VMA itself is destroyed.
+        //    Order: Allocator (last destroyed) → StagingPool → Context (first destroyed).
+        //    ~NovaContext() calls StagingPool::destroyAll() then Allocator::releaseAll(),
+        //    so both must outlive the context.
         (void)NovaAllocator::getInstance();
+        (void)NovaStagingPool::instance();
 
         // 1. Bring up the Vulkan compute context
         auto& ctx = NovaContext::instance();
 
-        // 2. Initialize pipeline cache and descriptor pool
+        // 2. Initialize pipeline cache, descriptor pool, and staging pool
         g_pipeline_cache.init(ctx.device());
         g_descriptor_pool.init(ctx.device());
+        NovaStagingPool::instance().init(ctx.allocator());
 
         // 3. Register our VMA-backed allocator for PrivateUse1
         c10::SetAllocator(

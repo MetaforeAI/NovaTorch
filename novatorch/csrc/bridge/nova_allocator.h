@@ -10,10 +10,13 @@
 
 /// PyTorch c10::Allocator backed by VMA (Vulkan Memory Allocator).
 ///
-/// Every allocation creates a VkBuffer with host-visible, persistently-mapped
-/// storage.  The mapped pointer is returned as the data pointer so PyTorch CPU
-/// code can read/write the memory directly, while the underlying VkBuffer is
-/// available for Vulkan compute dispatch.
+/// Every allocation creates a DEVICE_LOCAL VkBuffer in VRAM for GPU compute.
+/// Host access goes through a shared staging pool (NovaStagingPool) — no
+/// per-tensor host-visible mapping.
+///
+/// DataPtr::data() returns an opaque pointer (Allocation*) that is NOT
+/// CPU-dereferenceable, matching the CUDA model where data_ptr() returns
+/// a device pointer.
 ///
 /// All live allocations are tracked so they can be force-released at shutdown
 /// (before VMA is destroyed) to avoid assertion failures from PyTorch tensors
@@ -21,12 +24,15 @@
 class NovaAllocator : public c10::Allocator {
 public:
     /// Per-allocation bookkeeping stored as the DataPtr context.
+    ///
+    /// The buffer lives in DEVICE_LOCAL VRAM.  There is no per-tensor
+    /// staging buffer — staging comes from the shared NovaStagingPool
+    /// on demand for CPU↔GPU transfers.
     struct Allocation {
-        VkBuffer buffer;
+        VkBuffer buffer;          // DEVICE_LOCAL (VRAM)
         VmaAllocation vma_alloc;
-        void* mapped_ptr;
         size_t size;
-        VmaAllocator allocator; // cached for cleanup without singleton lookup
+        VmaAllocator allocator;   // cached for cleanup without singleton lookup
     };
 
     static NovaAllocator* getInstance();

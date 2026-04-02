@@ -1,5 +1,4 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
 
 #include <cmath>
 
@@ -64,7 +63,6 @@ at::Tensor dispatch_unary_math(
 
     PCNumel pc{numel};
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute(kernel_name, 2, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;
@@ -126,7 +124,6 @@ at::Tensor nova_pow_tensor_scalar(
 
     PCPow pc{numel, exponent.toFloat()};
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute("math_pow", 2, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;
@@ -162,8 +159,6 @@ at::Tensor nova_max_other(
 
     PCNumel pc{numel};
 
-    novatorch::flushNovaBuffer(self);
-    novatorch::flushNovaBuffer(other);
     dispatchCompute("math_max", 3, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;
@@ -195,8 +190,6 @@ at::Tensor nova_min_other(
 
     PCNumel pc{numel};
 
-    novatorch::flushNovaBuffer(self);
-    novatorch::flushNovaBuffer(other);
     dispatchCompute("math_min", 3, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;
@@ -240,7 +233,6 @@ at::Tensor nova_clamp(
     pc.has_min = min_val.has_value() ? 1 : 0;
     pc.has_max = max_val.has_value() ? 1 : 0;
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute("clamp", 2, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;
@@ -337,26 +329,23 @@ at::Tensor nova_lerp_scalar(
     // lerp(a,b,w) = a + w*(b-a) = a*(1-w) + b*w
     float w = weight.toFloat();
     // Use existing ops: result = self * (1-w) + end * w
-    // But we need to avoid broadcast issues, so do it via mapped memory
+    // But we need to avoid broadcast issues, so do it via staging transfers
     auto self_c = self.is_contiguous() ? self : self.contiguous();
     auto end_c = end.is_contiguous() ? end : end.contiguous();
     auto output = at::empty(self_c.sizes(), self_c.options());
 
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self_c);
-    novatorch::invalidateNovaBuffer(end_c);
-    const float* a = static_cast<const float*>(
-        novatorch::getNovaAllocation(self_c)->mapped_ptr);
-    const float* b = static_cast<const float*>(
-        novatorch::getNovaAllocation(end_c)->mapped_ptr);
-    float* out_ptr = static_cast<float*>(
-        novatorch::getNovaAllocation(output)->mapped_ptr);
-
     int64_t n = output.numel();
-    for (int64_t i = 0; i < n; ++i)
-        out_ptr[i] = a[i] + w * (b[i] - a[i]);
-
-    novatorch::flushNovaBuffer(output);
+    novatorch::withStagingRead(self_c, [&](const void* a_raw, size_t) {
+        const float* a = static_cast<const float*>(a_raw);
+        novatorch::withStagingRead(end_c, [&](const void* b_raw, size_t) {
+            const float* b = static_cast<const float*>(b_raw);
+            novatorch::withStagingWrite(output, [&](void* out_raw, size_t) {
+                float* out_ptr = static_cast<float*>(out_raw);
+                for (int64_t i = 0; i < n; ++i)
+                    out_ptr[i] = a[i] + w * (b[i] - a[i]);
+            });
+        });
+    });
     return output;
 }
 
@@ -378,19 +367,15 @@ at::Tensor& nova_lerp_scalar_inplace(
     float w = weight.toFloat();
     auto end_c = end.is_contiguous() ? end : end.contiguous();
 
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self);
-    novatorch::invalidateNovaBuffer(end_c);
-    float* a = static_cast<float*>(
-        novatorch::getNovaAllocation(self)->mapped_ptr);
-    const float* b = static_cast<const float*>(
-        novatorch::getNovaAllocation(end_c)->mapped_ptr);
-
     int64_t n = self.numel();
-    for (int64_t i = 0; i < n; ++i)
-        a[i] = a[i] + w * (b[i] - a[i]);
-
-    novatorch::flushNovaBuffer(self);
+    novatorch::withStagingRead(end_c, [&](const void* b_raw, size_t) {
+        const float* b = static_cast<const float*>(b_raw);
+        novatorch::withStagingReadWrite(self, [&](void* a_raw, size_t) {
+            float* a = static_cast<float*>(a_raw);
+            for (int64_t i = 0; i < n; ++i)
+                a[i] = a[i] + w * (b[i] - a[i]);
+        });
+    });
     return self;
 }
 
@@ -399,14 +384,12 @@ at::Tensor& nova_lerp_scalar_inplace(
 // ---------------------------------------------------------------------------
 
 at::Tensor& nova_sqrt_inplace(at::Tensor& self) {
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self);
-    float* ptr = static_cast<float*>(
-        novatorch::getNovaAllocation(self)->mapped_ptr);
-    int64_t n = self.numel();
-    for (int64_t i = 0; i < n; ++i)
-        ptr[i] = std::sqrt(ptr[i]);
-    novatorch::flushNovaBuffer(self);
+    novatorch::withStagingReadWrite(self, [&](void* raw, size_t nbytes) {
+        float* ptr = static_cast<float*>(raw);
+        int64_t n = static_cast<int64_t>(nbytes / sizeof(float));
+        for (int64_t i = 0; i < n; ++i)
+            ptr[i] = std::sqrt(ptr[i]);
+    });
     return self;
 }
 
@@ -418,13 +401,11 @@ at::Tensor& nova_div_inplace_scalar(
     at::Tensor& self,
     const at::Scalar& other) {
     float inv = 1.0f / other.toFloat();
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self);
-    float* ptr = static_cast<float*>(
-        novatorch::getNovaAllocation(self)->mapped_ptr);
-    int64_t n = self.numel();
-    for (int64_t i = 0; i < n; ++i)
-        ptr[i] *= inv;
-    novatorch::flushNovaBuffer(self);
+    novatorch::withStagingReadWrite(self, [&](void* raw, size_t nbytes) {
+        float* ptr = static_cast<float*>(raw);
+        int64_t n = static_cast<int64_t>(nbytes / sizeof(float));
+        for (int64_t i = 0; i < n; ++i)
+            ptr[i] *= inv;
+    });
     return self;
 }

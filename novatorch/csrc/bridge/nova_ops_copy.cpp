@@ -1,5 +1,4 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
 
 #include <c10/core/ScalarType.h>
 #include <cstring>
@@ -13,6 +12,31 @@ bool isNova(const at::Tensor& t) {
 
 size_t tensorBytes(const at::Tensor& t) {
     return static_cast<size_t>(t.numel()) * t.element_size();
+}
+
+/// Strided read from @p src_base into contiguous @p dst_ptr.
+/// Handles arbitrary dimensionality via index vector iteration.
+void stridedCopyToContiguous(
+    const char* src_base,
+    char* dst_ptr,
+    size_t elem_size,
+    int64_t numel,
+    at::IntArrayRef sizes,
+    at::IntArrayRef strides)
+{
+    const int ndim = static_cast<int>(sizes.size());
+    std::vector<int64_t> idx(ndim, 0);
+    for (int64_t i = 0; i < numel; ++i) {
+        int64_t src_byte_offset = 0;
+        for (int d = 0; d < ndim; ++d) {
+            src_byte_offset += idx[d] * strides[d] * static_cast<int64_t>(elem_size);
+        }
+        std::memcpy(dst_ptr + i * elem_size, src_base + src_byte_offset, elem_size);
+        for (int d = ndim - 1; d >= 0; --d) {
+            if (++idx[d] < sizes[d]) break;
+            idx[d] = 0;
+        }
+    }
 }
 
 } // anonymous namespace
@@ -33,92 +57,67 @@ at::Tensor nova_copy_from(
 
     if (src_nova && dst_nova) {
         if (self.is_contiguous() && self.storage().nbytes() >= tensorBytes(dst)) {
-            // Flush pending batched dispatches before GPU-side copy
-            NovaBatchContext::instance().flush();
-            VkBuffer src_buf = novatorch::getNovaBuffer(self);
-            VkBuffer dst_buf = novatorch::getNovaBuffer(dst);
-            VkDeviceSize copy_size = static_cast<VkDeviceSize>(tensorBytes(dst));
-
-            NovaContext::instance().executeSync([&](VkCommandBuffer cmd) {
-                VkBufferCopy region{};
-                region.srcOffset = 0;
-                region.dstOffset = 0;
-                region.size = copy_size;
-                vkCmdCopyBuffer(cmd, src_buf, dst_buf, 1, &region);
-            });
+            // Contiguous Nova→Nova: device-to-device copy
+            novatorch::copyDeviceToDevice(self, dst, tensorBytes(dst));
         } else {
-            // Non-contiguous source: element-by-element through mapped memory
-            NovaBatchContext::instance().flush();
-            novatorch::invalidateNovaBuffer(self);
-            auto* alloc_src = novatorch::getNovaAllocation(self);
-            auto* alloc_dst = novatorch::getNovaAllocation(dst);
-            const float* src_base = static_cast<const float*>(alloc_src->mapped_ptr);
-            float* dst_ptr = static_cast<float*>(alloc_dst->mapped_ptr);
-            int64_t n = dst.numel();
-            auto src_strides = self.strides();
-            auto src_sizes = self.sizes();
-            int ndim = self.dim();
-            std::vector<int64_t> idx(ndim, 0);
-            for (int64_t i = 0; i < n; ++i) {
-                int64_t src_offset = 0;
-                for (int d = 0; d < ndim; ++d)
-                    src_offset += idx[d] * src_strides[d];
-                dst_ptr[i] = src_base[src_offset];
-                for (int d = ndim - 1; d >= 0; --d) {
-                    if (++idx[d] < src_sizes[d]) break;
-                    idx[d] = 0;
-                }
-            }
-            novatorch::flushNovaBuffer(dst);
+            // Non-contiguous Nova→Nova: download src to staging, strided read,
+            // then upload contiguous result to dst.
+            const size_t elem_size = self.element_size();
+            const int64_t numel = dst.numel();
+            const size_t dst_bytes = tensorBytes(dst);
+
+            novatorch::withStagingRead(self, [&](const void* src_staging, size_t) {
+                // Allocate a temporary contiguous CPU buffer for the result
+                std::vector<char> contiguous_buf(dst_bytes);
+                stridedCopyToContiguous(
+                    static_cast<const char*>(src_staging),
+                    contiguous_buf.data(),
+                    elem_size,
+                    numel,
+                    self.sizes(),
+                    self.strides());
+                // Upload the contiguous result to dst device buffer
+                novatorch::uploadToDevice(dst, contiguous_buf.data(), dst_bytes);
+            });
         }
         return dst;
     }
 
     if (!src_nova && dst_nova) {
-        // CPU -> Nova: handle non-contiguous source
-        auto* alloc = novatorch::getNovaAllocation(dst);
+        // CPU→Nova: upload CPU data to device
         if (self.is_contiguous()) {
-            std::memcpy(alloc->mapped_ptr, self.data_ptr(), tensorBytes(self));
+            novatorch::uploadToDevice(dst, self.data_ptr(), tensorBytes(self));
         } else {
-            // Make contiguous on CPU first, then memcpy
             auto src_contig = self.contiguous();
-            std::memcpy(alloc->mapped_ptr, src_contig.data_ptr(), tensorBytes(src_contig));
+            novatorch::uploadToDevice(dst, src_contig.data_ptr(), tensorBytes(src_contig));
         }
-        novatorch::flushNovaBuffer(dst);
         return dst;
     }
 
     if (src_nova && !dst_nova) {
-        // Nova -> CPU: flush pending GPU work, then invalidate + memcpy
-        NovaBatchContext::instance().flush();
-        novatorch::invalidateNovaBuffer(self);
-        auto* alloc = novatorch::getNovaAllocation(self);
+        // Nova→CPU
         if (self.is_contiguous() && self.storage().nbytes() >= tensorBytes(dst)) {
-            std::memcpy(dst.data_ptr(), alloc->mapped_ptr, tensorBytes(dst));
+            // Contiguous: direct download
+            novatorch::downloadFromDevice(self, dst.data_ptr(), tensorBytes(dst));
         } else {
-            // Non-contiguous source: element-by-element
-            const float* src_base = static_cast<const float*>(alloc->mapped_ptr);
-            float* dst_ptr = static_cast<float*>(dst.data_ptr());
-            int64_t n = dst.numel();
-            auto src_strides = self.strides();
-            auto src_sizes = self.sizes();
-            int ndim = self.dim();
-            std::vector<int64_t> idx(ndim, 0);
-            for (int64_t i = 0; i < n; ++i) {
-                int64_t src_offset = 0;
-                for (int d = 0; d < ndim; ++d)
-                    src_offset += idx[d] * src_strides[d];
-                dst_ptr[i] = src_base[src_offset];
-                for (int d = ndim - 1; d >= 0; --d) {
-                    if (++idx[d] < src_sizes[d]) break;
-                    idx[d] = 0;
-                }
-            }
+            // Non-contiguous: download to staging, strided read into CPU dst
+            const size_t elem_size = self.element_size();
+            const int64_t numel = dst.numel();
+
+            novatorch::withStagingRead(self, [&](const void* staging, size_t) {
+                stridedCopyToContiguous(
+                    static_cast<const char*>(staging),
+                    static_cast<char*>(dst.data_ptr()),
+                    elem_size,
+                    numel,
+                    self.sizes(),
+                    self.strides());
+            });
         }
         return dst;
     }
 
-    // CPU -> CPU fallback
+    // CPU→CPU fallback
     std::memcpy(dst.data_ptr(), self.data_ptr(), tensorBytes(self));
     return dst;
 }
@@ -147,59 +146,55 @@ at::Scalar nova_local_scalar_dense(const at::Tensor& self) {
         "nova_local_scalar_dense: expected 1-element tensor, got ",
         self.numel());
 
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self);
-    auto* alloc = novatorch::getNovaAllocation(self);
-
     switch (self.scalar_type()) {
         case c10::ScalarType::Float: {
             float v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(v);
         }
         case c10::ScalarType::Double: {
             double v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(v);
         }
         case c10::ScalarType::Half: {
             c10::Half v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(static_cast<float>(v));
         }
         case c10::ScalarType::BFloat16: {
             c10::BFloat16 v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(static_cast<float>(v));
         }
         case c10::ScalarType::Int: {
             int32_t v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(static_cast<int64_t>(v));
         }
         case c10::ScalarType::Long: {
             int64_t v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(v);
         }
         case c10::ScalarType::Short: {
             int16_t v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(static_cast<int64_t>(v));
         }
         case c10::ScalarType::Byte: {
             uint8_t v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(static_cast<int64_t>(v));
         }
         case c10::ScalarType::Char: {
             int8_t v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(static_cast<int64_t>(v));
         }
         case c10::ScalarType::Bool: {
             bool v;
-            std::memcpy(&v, alloc->mapped_ptr, sizeof(v));
+            novatorch::downloadFromDevice(self, &v, sizeof(v));
             return at::Scalar(v);
         }
         default:

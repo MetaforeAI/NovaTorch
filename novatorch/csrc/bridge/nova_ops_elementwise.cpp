@@ -1,5 +1,4 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
 
 // ---------------------------------------------------------------------------
 // Push-constant structs — must match the GLSL layout(push_constant) exactly.
@@ -247,22 +246,21 @@ at::Tensor nova_add_scalar(
     const at::Scalar& other,
     const at::Scalar& alpha)
 {
-    // self + alpha * other — implemented directly via mapped memory
+    // self + alpha * other — implemented via staging transfers
     auto self_c = self.is_contiguous() ? self : self.contiguous();
     auto output = at::empty(self_c.sizes(), self_c.options());
     int64_t n = output.numel();
     if (n == 0) return output;
 
     float val = alpha.toFloat() * other.toFloat();
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self_c);
-    const float* src = static_cast<const float*>(
-        novatorch::getNovaAllocation(self_c)->mapped_ptr);
-    float* dst = static_cast<float*>(
-        novatorch::getNovaAllocation(output)->mapped_ptr);
-    for (int64_t i = 0; i < n; ++i)
-        dst[i] = src[i] + val;
-    novatorch::flushNovaBuffer(output);
+    novatorch::withStagingRead(self_c, [&](const void* src_raw, size_t) {
+        const float* src = static_cast<const float*>(src_raw);
+        novatorch::withStagingWrite(output, [&](void* dst_raw, size_t) {
+            float* dst = static_cast<float*>(dst_raw);
+            for (int64_t i = 0; i < n; ++i)
+                dst[i] = src[i] + val;
+        });
+    });
     return output;
 }
 

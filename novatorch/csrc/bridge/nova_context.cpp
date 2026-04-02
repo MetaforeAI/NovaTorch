@@ -1,6 +1,7 @@
 #include "nova_context.h"
 
 #include "nova_allocator.h"
+#include "nova_staging_pool.h"
 #include "nova_compute.h"
 #include <cstdlib>
 
@@ -29,6 +30,10 @@ NovaContext::~NovaContext() {
     if (compute_ && compute_->getDevice() != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(compute_->getDevice());
     }
+
+    // Destroy staging pool before VMA allocator — staging buffers are
+    // VMA allocations that must be freed first.
+    NovaStagingPool::instance().destroyAll();
 
     // Force-release all VMA allocations that PyTorch tensors may still hold.
     // This MUST happen before NovaCompute (and thus VMA) is destroyed,

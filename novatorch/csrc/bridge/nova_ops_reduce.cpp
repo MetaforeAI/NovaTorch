@@ -1,5 +1,5 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
+#include "nova_storage.h"
 #include <cstring>
 
 // ---------------------------------------------------------------------------
@@ -36,7 +36,6 @@ at::Tensor nova_sum(
         static_cast<VkDeviceSize>(out_alloc->size)
     };
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute("reduce_sum", 2, sizeof(pc), &pc, bufs, sizes, num_groups);
 
     // Iterative reduction until single workgroup remains
@@ -63,15 +62,13 @@ at::Tensor nova_sum(
         remaining = next_groups;
     }
 
-    // Flush batched dispatches before reading result from mapped memory
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(partial);
-    float result = *static_cast<float*>(partial.data_ptr());
+    // Download single-float result from device
+    float result = 0.0f;
+    novatorch::downloadFromDevice(partial, &result, sizeof(float));
 
     auto output_dtype = dtype.value_or(self.scalar_type());
     auto output = at::empty({}, self.options().dtype(output_dtype));
-    *static_cast<float*>(output.data_ptr()) = result;
-    novatorch::flushNovaBuffer(output);
+    novatorch::uploadToDevice(output, &result, sizeof(float));
 
     return output;
 }
@@ -92,15 +89,14 @@ at::Tensor nova_mean(
 
     at::Tensor sum_result = nova_sum(self, dtype);
 
-    // nova_sum already flushed; invalidate to read back
-    novatorch::invalidateNovaBuffer(sum_result);
-    float sum_val = *static_cast<float*>(sum_result.data_ptr());
+    // Download sum result from device
+    float sum_val = 0.0f;
+    novatorch::downloadFromDevice(sum_result, &sum_val, sizeof(float));
     float mean_val = sum_val / static_cast<float>(self.numel());
 
     auto output_dtype = dtype.value_or(self.scalar_type());
     auto output = at::empty({}, self.options().dtype(output_dtype));
-    *static_cast<float*>(output.data_ptr()) = mean_val;
-    novatorch::flushNovaBuffer(output);
+    novatorch::uploadToDevice(output, &mean_val, sizeof(float));
 
     return output;
 }
@@ -223,32 +219,39 @@ at::Tensor nova_cat(const at::ITensorListRef& tensors, int64_t dim) {
     // For contiguous tensors along dim=0, this is a simple sequential memcpy
     // For general case, use element-by-element copy via CPU fallback
     if (dim == 0) {
-        // Fast path for dim=0 concat of contiguous tensors
-        NovaBatchContext::instance().flush();
-        float* dst = static_cast<float*>(output.data_ptr());
-        int64_t offset = 0;
+        // Fast path for dim=0 concat: device-to-device copy per source tensor
+        size_t byte_offset = 0;
         for (size_t i = 0; i < materialized.size(); ++i) {
             const auto& t = materialized[i].get();
             auto t_contig = t.contiguous();
-            novatorch::invalidateNovaBuffer(t_contig);
-            int64_t nbytes = t_contig.numel() * t_contig.element_size();
-            std::memcpy(dst + offset, t_contig.data_ptr(),
-                        static_cast<size_t>(nbytes));
-            offset += t_contig.numel();
+            auto nbytes = static_cast<size_t>(
+                t_contig.numel() * t_contig.element_size());
+            novatorch::copyDeviceToDevice(t_contig, output, nbytes);
+            byte_offset += nbytes;
         }
-        novatorch::flushNovaBuffer(output);
     } else {
-        // General case: CPU fallback
+        // General case: CPU fallback via staging
+        // Download all source tensors to CPU buffers
         std::vector<at::Tensor> cpu_tensors;
         cpu_tensors.reserve(materialized.size());
         for (size_t i = 0; i < materialized.size(); ++i) {
-            cpu_tensors.push_back(materialized[i].get().to(at::kCPU));
+            const auto& t = materialized[i].get();
+            auto t_contig = t.contiguous();
+            auto nbytes = static_cast<size_t>(
+                t_contig.numel() * t_contig.element_size());
+            auto cpu_t = at::empty(
+                t_contig.sizes(),
+                t_contig.options().device(at::kCPU));
+            novatorch::downloadFromDevice(
+                t_contig, cpu_t.data_ptr(), nbytes);
+            cpu_tensors.push_back(cpu_t);
         }
         auto cpu_result = at::cat(cpu_tensors, dim);
-        // Copy back to Nova
-        std::memcpy(output.data_ptr(), cpu_result.data_ptr(),
-                    static_cast<size_t>(cpu_result.numel() * cpu_result.element_size()));
-        novatorch::flushNovaBuffer(output);
+        // Upload result back to device
+        novatorch::uploadToDevice(
+            output, cpu_result.data_ptr(),
+            static_cast<size_t>(
+                cpu_result.numel() * cpu_result.element_size()));
     }
 
     return output;

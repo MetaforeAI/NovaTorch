@@ -1,5 +1,4 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
 
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
@@ -10,7 +9,6 @@
 #include <c10/util/ArrayRef.h>
 
 #include <algorithm>
-#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -190,14 +188,21 @@ at::Tensor& nova_fill_scalar(at::Tensor& self, const at::Scalar& value) {
     auto numel = static_cast<uint32_t>(self.numel());
     if (numel == 0) return self;
 
-    NovaBatchContext::instance().flush();
-    // For mapped memory, just write directly from CPU
-    float val = value.toFloat();
-    float* ptr = static_cast<float*>(self.data_ptr());
-    for (uint32_t i = 0; i < numel; ++i) {
-        ptr[i] = val;
-    }
-    novatorch::flushNovaBuffer(self);
+    struct { uint32_t numel; float value; } pc = {
+        numel, value.toFloat()
+    };
+
+    VkBuffer buf = novatorch::getNovaBuffer(self);
+    VkDeviceSize buf_size = static_cast<VkDeviceSize>(
+        self.numel() * self.element_size());
+    uint32_t groups = (numel + 255) / 256;
+
+    dispatchCompute("fill_scalar",
+                    /*num_buffers=*/1,
+                    /*push_constant_size=*/sizeof(pc),
+                    /*push_data=*/&pc,
+                    &buf, &buf_size,
+                    groups);
     return self;
 }
 
@@ -206,11 +211,22 @@ at::Tensor& nova_fill_scalar(at::Tensor& self, const at::Scalar& value) {
 // ---------------------------------------------------------------------------
 
 at::Tensor& nova_zero_(at::Tensor& self) {
-    auto nbytes = self.numel() * self.element_size();
-    if (nbytes == 0) return self;
-    NovaBatchContext::instance().flush();
-    std::memset(self.data_ptr(), 0, static_cast<size_t>(nbytes));
-    novatorch::flushNovaBuffer(self);
+    auto numel = static_cast<uint32_t>(self.numel());
+    if (numel == 0) return self;
+
+    struct { uint32_t numel; float value; } pc = { numel, 0.0f };
+
+    VkBuffer buf = novatorch::getNovaBuffer(self);
+    VkDeviceSize buf_size = static_cast<VkDeviceSize>(
+        self.numel() * self.element_size());
+    uint32_t groups = (numel + 255) / 256;
+
+    dispatchCompute("fill_scalar",
+                    /*num_buffers=*/1,
+                    /*push_constant_size=*/sizeof(pc),
+                    /*push_data=*/&pc,
+                    &buf, &buf_size,
+                    groups);
     return self;
 }
 
@@ -593,43 +609,43 @@ at::Tensor nova_contiguous(
 
     // Allocate new contiguous tensor and copy
     at::Tensor output = at::empty(self.sizes(), self.options());
-    // Use memcpy for contiguous -> contiguous (self might be non-contiguous)
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self);
     auto numel = self.numel();
     if (numel == 0) return output;
 
-    // Element-by-element copy handling non-contiguous source
-    float* dst = static_cast<float*>(output.data_ptr());
-    float* src = static_cast<float*>(self.data_ptr());
+    auto src_sizes   = self.sizes();
+    auto src_strides = self.strides();
+    int64_t ndim     = self.dim();
+    int64_t src_off  = self.storage_offset();
 
-    auto sizes = self.sizes();
-    auto strides = self.strides();
-    int64_t ndim = self.dim();
+    // Download source device buffer into staging, perform strided->contiguous
+    // gather on CPU, then upload the contiguous result to the output device buffer.
+    novatorch::withStagingRead(self, [&](const void* src_raw, size_t) {
+        const float* src = static_cast<const float*>(src_raw);
 
-    if (ndim == 0) {
-        dst[0] = src[self.storage_offset()];
-    } else {
-        // Use flat iteration over the logical tensor
-        std::vector<int64_t> indices(ndim, 0);
-        for (int64_t flat = 0; flat < numel; ++flat) {
-            // Compute source offset
-            int64_t src_offset = self.storage_offset();
-            for (int64_t d = 0; d < ndim; ++d) {
-                src_offset += indices[d] * strides[d];
+        novatorch::withStagingWrite(output, [&](void* dst_raw, size_t) {
+            float* dst = static_cast<float*>(dst_raw);
+
+            if (ndim == 0) {
+                dst[0] = src[src_off];
+            } else {
+                std::vector<int64_t> indices(ndim, 0);
+                for (int64_t flat = 0; flat < numel; ++flat) {
+                    int64_t src_offset = src_off;
+                    for (int64_t d = 0; d < ndim; ++d) {
+                        src_offset += indices[d] * src_strides[d];
+                    }
+                    dst[flat] = src[src_offset];
+
+                    for (int64_t d = ndim - 1; d >= 0; --d) {
+                        indices[d]++;
+                        if (indices[d] < src_sizes[d]) break;
+                        indices[d] = 0;
+                    }
+                }
             }
-            dst[flat] = src[src_offset];
+        });
+    });
 
-            // Increment indices (innermost first)
-            for (int64_t d = ndim - 1; d >= 0; --d) {
-                indices[d]++;
-                if (indices[d] < sizes[d]) break;
-                indices[d] = 0;
-            }
-        }
-    }
-
-    novatorch::flushNovaBuffer(output);
     return output;
 }
 
@@ -650,10 +666,8 @@ at::Tensor nova_clone(
             at::Tensor output = at::empty(self.sizes(), self.options());
             auto nbytes = self.numel() * self.element_size();
             if (nbytes > 0) {
-                NovaBatchContext::instance().flush();
-                std::memcpy(output.data_ptr(), self.data_ptr(),
-                            static_cast<size_t>(nbytes));
-                novatorch::flushNovaBuffer(output);
+                novatorch::copyDeviceToDevice(
+                    self, output, static_cast<size_t>(nbytes));
             }
             return output;
         }
@@ -775,12 +789,12 @@ at::Tensor& nova_uniform_(
     std::uniform_real_distribution<float> dist(
         static_cast<float>(from), static_cast<float>(to));
 
-    NovaBatchContext::instance().flush();
-    float* ptr = static_cast<float*>(self.data_ptr());
-    for (int64_t i = 0; i < numel; ++i) {
-        ptr[i] = dist(rng);
-    }
-    novatorch::flushNovaBuffer(self);
+    novatorch::withStagingWrite(self, [&](void* ptr_raw, size_t) {
+        float* ptr = static_cast<float*>(ptr_raw);
+        for (int64_t i = 0; i < numel; ++i) {
+            ptr[i] = dist(rng);
+        }
+    });
     return self;
 }
 
@@ -801,11 +815,11 @@ at::Tensor& nova_normal_(
     std::normal_distribution<float> dist(
         static_cast<float>(mean), static_cast<float>(std_val));
 
-    NovaBatchContext::instance().flush();
-    float* ptr = static_cast<float*>(self.data_ptr());
-    for (int64_t i = 0; i < numel; ++i) {
-        ptr[i] = dist(rng);
-    }
-    novatorch::flushNovaBuffer(self);
+    novatorch::withStagingWrite(self, [&](void* ptr_raw, size_t) {
+        float* ptr = static_cast<float*>(ptr_raw);
+        for (int64_t i = 0; i < numel; ++i) {
+            ptr[i] = dist(rng);
+        }
+    });
     return self;
 }

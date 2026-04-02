@@ -1,5 +1,5 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
+#include "nova_storage.h"
 #include <cmath>
 
 // ---------------------------------------------------------------------------
@@ -95,7 +95,6 @@ at::Tensor nova_softmax(
     // One workgroup per row
     uint32_t num_rows = outer_size * inner_size;
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute("softmax", 2, sizeof(pc), &pc, bufs, sizes, num_rows);
     return output;
 }
@@ -140,7 +139,6 @@ at::Tensor nova_log_softmax(
     PCSoftmax pc{outer_size, dim_size, inner_size};
     uint32_t num_rows = outer_size * inner_size;
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute("log_softmax", 2, sizeof(pc), &pc, bufs, sizes, num_rows);
     return output;
 }
@@ -207,9 +205,6 @@ std::tuple<at::Tensor, at::Tensor> nova_nll_loss_forward(
     pc.reduction    = static_cast<int32_t>(reduction);
     pc.ignore_index = static_cast<int32_t>(ignore_index);
 
-    novatorch::flushNovaBuffer(self);
-    novatorch::flushNovaBuffer(target);
-
     if (reduction == 0) {
         // No reduction: dispatch one thread per batch element
         dispatchCompute("nll_loss", 3, sizeof(pc), &pc, bufs, buf_sizes,
@@ -219,22 +214,19 @@ std::tuple<at::Tensor, at::Tensor> nova_nll_loss_forward(
         dispatchCompute("nll_loss", 3, sizeof(pc), &pc, bufs, buf_sizes, 1);
     }
 
-    // Flush batched dispatches before reading mapped memory
-    NovaBatchContext::instance().flush();
-
     // Compute total_weight on CPU (count of non-ignored samples)
-    {
-        novatorch::invalidateNovaBuffer(target);
-        const int64_t* tgt_ptr = static_cast<const int64_t*>(target.data_ptr());
+    novatorch::withStagingRead(target, [&](const void* tgt_raw, size_t) {
+        const int64_t* tgt_ptr = static_cast<const int64_t*>(tgt_raw);
         float tw = 0.0f;
         for (uint32_t i = 0; i < batch_size; ++i) {
             if (tgt_ptr[i] != static_cast<int64_t>(ignore_index)) {
                 tw += 1.0f;
             }
         }
-        *static_cast<float*>(total_weight.data_ptr()) = tw;
-        novatorch::flushNovaBuffer(total_weight);
-    }
+        novatorch::withStagingWrite(total_weight, [&](void* tw_raw, size_t) {
+            *static_cast<float*>(tw_raw) = tw;
+        });
+    });
 
     return std::make_tuple(output, total_weight);
 }
@@ -267,55 +259,62 @@ at::Tensor& nova_nll_loss_backward_grad_input(
     grad_input.resize_as_(self);
     grad_input.zero_();
 
-    // Flush pending GPU work before reading mapped memory
-    NovaBatchContext::instance().flush();
+    // Download inputs to CPU-side buffers
+    auto go_nbytes = static_cast<size_t>(
+        grad_output.numel() * grad_output.element_size());
+    auto tgt_nbytes = static_cast<size_t>(
+        target.numel() * target.element_size());
 
-    // Read inputs from mapped memory
-    novatorch::invalidateNovaBuffer(grad_output);
-    novatorch::invalidateNovaBuffer(target);
-    novatorch::invalidateNovaBuffer(total_weight);
+    std::vector<uint8_t> go_buf(go_nbytes);
+    std::vector<uint8_t> tgt_buf(tgt_nbytes);
+    float tw = 0.0f;
 
-    const float* grad_out_ptr = static_cast<const float*>(grad_output.data_ptr());
-    const int64_t* target_ptr = static_cast<const int64_t*>(target.data_ptr());
+    novatorch::downloadFromDevice(grad_output, go_buf.data(), go_nbytes);
+    novatorch::downloadFromDevice(target, tgt_buf.data(), tgt_nbytes);
+    novatorch::downloadFromDevice(total_weight, &tw, sizeof(float));
 
-    // Read total_weight for mean reduction
-    float tw = *static_cast<const float*>(total_weight.data_ptr());
+    const float* grad_out_ptr = reinterpret_cast<const float*>(go_buf.data());
+    const int64_t* target_ptr = reinterpret_cast<const int64_t*>(tgt_buf.data());
 
     // Get weight data if present
+    std::vector<uint8_t> w_buf;
     const float* weight_ptr = nullptr;
     if (weight.has_value() && weight->defined()) {
-        novatorch::invalidateNovaBuffer(*weight);
-        weight_ptr = static_cast<const float*>(weight->data_ptr());
+        auto w_nbytes = static_cast<size_t>(
+            weight->numel() * weight->element_size());
+        w_buf.resize(w_nbytes);
+        novatorch::downloadFromDevice(*weight, w_buf.data(), w_nbytes);
+        weight_ptr = reinterpret_cast<const float*>(w_buf.data());
     }
 
-    // Write grad_input via mapped memory
-    novatorch::invalidateNovaBuffer(grad_input);
-    float* gi_ptr = static_cast<float*>(grad_input.data_ptr());
+    // Compute grad_input on CPU then upload
+    novatorch::withStagingReadWrite(grad_input, [&](void* gi_raw, size_t) {
+        float* gi_ptr = static_cast<float*>(gi_raw);
 
-    for (int64_t i = 0; i < batch_size; ++i) {
-        const int64_t t = target_ptr[i];
-        if (t == ignore_index) continue;
+        for (int64_t i = 0; i < batch_size; ++i) {
+            const int64_t t = target_ptr[i];
+            if (t == ignore_index) continue;
 
-        TORCH_CHECK(t >= 0 && t < num_classes,
-            "Target ", t, " is out of bounds for num_classes=", num_classes);
+            TORCH_CHECK(t >= 0 && t < num_classes,
+                "Target ", t, " is out of bounds for num_classes=", num_classes);
 
-        float w = weight_ptr ? weight_ptr[t] : 1.0f;
+            float w = weight_ptr ? weight_ptr[t] : 1.0f;
 
-        if (reduction == 0) {
-            // none: grad_output is per-sample
-            gi_ptr[i * num_classes + t] = -grad_out_ptr[i] * w;
-        } else if (reduction == 1) {
-            // mean: grad_output is scalar, divide by total_weight
-            if (tw > 0.0f) {
-                gi_ptr[i * num_classes + t] = -grad_out_ptr[0] * w / tw;
+            if (reduction == 0) {
+                // none: grad_output is per-sample
+                gi_ptr[i * num_classes + t] = -grad_out_ptr[i] * w;
+            } else if (reduction == 1) {
+                // mean: grad_output is scalar, divide by total_weight
+                if (tw > 0.0f) {
+                    gi_ptr[i * num_classes + t] = -grad_out_ptr[0] * w / tw;
+                }
+            } else {
+                // sum: grad_output is scalar
+                gi_ptr[i * num_classes + t] = -grad_out_ptr[0] * w;
             }
-        } else {
-            // sum: grad_output is scalar
-            gi_ptr[i * num_classes + t] = -grad_out_ptr[0] * w;
         }
-    }
+    });
 
-    novatorch::flushNovaBuffer(grad_input);
     return grad_input;
 }
 
@@ -343,36 +342,36 @@ at::Tensor nova_log_softmax_backward_data(
 
     auto grad_input = at::empty_like(grad_output);
 
-    // Flush pending GPU work before reading mapped memory
-    NovaBatchContext::instance().flush();
+    // Use staging to read grad_output and output, write grad_input
+    novatorch::withStagingRead(grad_output, [&](const void* go_raw, size_t) {
+    novatorch::withStagingRead(output, [&](const void* out_raw, size_t) {
+    novatorch::withStagingWrite(grad_input, [&](void* gi_raw, size_t) {
+        const float* go_ptr = static_cast<const float*>(go_raw);
+        const float* out_ptr = static_cast<const float*>(out_raw);
+        float* gi_ptr = static_cast<float*>(gi_raw);
 
-    // Read from mapped memory
-    novatorch::invalidateNovaBuffer(grad_output);
-    novatorch::invalidateNovaBuffer(output);
-
-    const float* go_ptr = static_cast<const float*>(grad_output.data_ptr());
-    const float* out_ptr = static_cast<const float*>(output.data_ptr());
-    float* gi_ptr = static_cast<float*>(grad_input.data_ptr());
-
-    // For each row along the softmax dim:
-    // grad_input[i] = grad_output[i] - exp(output[i]) * sum(grad_output)
-    for (uint32_t o = 0; o < outer_size; ++o) {
-        for (uint32_t inn = 0; inn < inner_size; ++inn) {
-            // Compute sum of grad_output along dim
-            float sum_go = 0.0f;
-            for (uint32_t d = 0; d < dim_size; ++d) {
-                size_t idx = (o * dim_size + d) * inner_size + inn;
-                sum_go += go_ptr[idx];
-            }
-            // Compute grad_input
-            for (uint32_t d = 0; d < dim_size; ++d) {
-                size_t idx = (o * dim_size + d) * inner_size + inn;
-                gi_ptr[idx] = go_ptr[idx] - std::exp(out_ptr[idx]) * sum_go;
+        // For each row along the softmax dim:
+        // grad_input[i] = grad_output[i] - exp(output[i]) * sum(grad_output)
+        for (uint32_t o = 0; o < outer_size; ++o) {
+            for (uint32_t inn = 0; inn < inner_size; ++inn) {
+                // Compute sum of grad_output along dim
+                float sum_go = 0.0f;
+                for (uint32_t d = 0; d < dim_size; ++d) {
+                    size_t idx = (o * dim_size + d) * inner_size + inn;
+                    sum_go += go_ptr[idx];
+                }
+                // Compute grad_input
+                for (uint32_t d = 0; d < dim_size; ++d) {
+                    size_t idx = (o * dim_size + d) * inner_size + inn;
+                    gi_ptr[idx] =
+                        go_ptr[idx] - std::exp(out_ptr[idx]) * sum_go;
+                }
             }
         }
-    }
+    });
+    });
+    });
 
-    novatorch::flushNovaBuffer(grad_input);
     return grad_input;
 }
 

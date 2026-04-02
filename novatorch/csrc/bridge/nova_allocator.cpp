@@ -29,7 +29,7 @@ c10::DataPtr NovaAllocator::allocate(size_t nbytes) {
 
     VmaAllocator vma = NovaContext::instance().allocator();
 
-    // Buffer creation info
+    // Device-local buffer in VRAM for GPU compute
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = static_cast<VkDeviceSize>(nbytes);
@@ -38,18 +38,15 @@ c10::DataPtr NovaAllocator::allocate(size_t nbytes) {
                       | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    // VMA allocation info: host-visible, persistently mapped
     VmaAllocationCreateInfo alloc_ci{};
-    alloc_ci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-                   | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation vma_alloc = VK_NULL_HANDLE;
-    VmaAllocationInfo alloc_info{};
 
     VkResult result = vmaCreateBuffer(
-        vma, &buffer_info, &alloc_ci, &buffer, &vma_alloc, &alloc_info);
+        vma, &buffer_info, &alloc_ci, &buffer, &vma_alloc, nullptr);
 
     if (result != VK_SUCCESS) {
         throw std::runtime_error(
@@ -62,7 +59,6 @@ c10::DataPtr NovaAllocator::allocate(size_t nbytes) {
     auto* alloc = new Allocation{
         buffer,
         vma_alloc,
-        alloc_info.pMappedData,
         nbytes,
         vma
     };
@@ -73,8 +69,11 @@ c10::DataPtr NovaAllocator::allocate(size_t nbytes) {
         live_.insert(alloc);
     }
 
+    // DataPtr::data() stores the Allocation* as an opaque handle.
+    // It is NOT CPU-dereferenceable (like CUDA device pointers).
+    // DataPtr::get_context() also stores Allocation* for the deleter.
     return c10::DataPtr(
-        alloc->mapped_ptr,
+        reinterpret_cast<void*>(alloc),
         static_cast<void*>(alloc),
         &NovaAllocator::deleter,
         c10::Device(c10::DeviceType::PrivateUse1, 0));

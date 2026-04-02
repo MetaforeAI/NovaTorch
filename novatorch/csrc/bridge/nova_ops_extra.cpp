@@ -1,5 +1,5 @@
 #include "nova_ops.h"
-#include "nova_batch_context.h"
+#include "nova_storage.h"
 
 #include <cstring>
 #include <cmath>
@@ -37,20 +37,6 @@ int64_t compute_offset(
     return offset;
 }
 
-/// Read a single float element from a tensor (handles non-contiguous).
-float read_float_element(const at::Tensor& t, int64_t linear_idx) {
-    auto indices = unravel_index(linear_idx, t.sizes());
-    int64_t offset = compute_offset(indices, t.strides(), t.storage_offset());
-    return static_cast<const float*>(t.data_ptr())[offset];
-}
-
-/// Write a single float element to a tensor (handles non-contiguous).
-void write_float_element(at::Tensor& t, int64_t linear_idx, float val) {
-    auto indices = unravel_index(linear_idx, t.sizes());
-    int64_t offset = compute_offset(indices, t.strides(), t.storage_offset());
-    static_cast<float*>(t.data_ptr())[offset] = val;
-}
-
 } // anonymous namespace
 
 // ===================================================================
@@ -73,10 +59,6 @@ at::Tensor nova_embedding(
     auto weight_c = weight.contiguous();
     auto indices_c = indices.contiguous();
 
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(weight_c);
-    novatorch::invalidateNovaBuffer(indices_c);
-
     int64_t embedding_dim = weight_c.size(1);
     int64_t num_indices = indices_c.numel();
 
@@ -85,39 +67,44 @@ at::Tensor nova_embedding(
     out_sizes.push_back(embedding_dim);
     auto output = at::empty(out_sizes, weight_c.options());
 
-    const float* w_ptr = static_cast<const float*>(weight_c.data_ptr());
-    float* out_ptr = static_cast<float*>(output.data_ptr());
+    novatorch::withStagingRead(weight_c, [&](const void* w_raw, size_t) {
+    novatorch::withStagingRead(indices_c, [&](const void* i_raw, size_t) {
+    novatorch::withStagingWrite(output, [&](void* o_raw, size_t) {
+        const float* w_ptr = static_cast<const float*>(w_raw);
+        float* out_ptr = static_cast<float*>(o_raw);
 
-    // Indices can be Long or Int
-    if (indices_c.scalar_type() == at::ScalarType::Long) {
-        const int64_t* idx_ptr = static_cast<const int64_t*>(indices_c.data_ptr());
-        for (int64_t i = 0; i < num_indices; ++i) {
-            int64_t idx = idx_ptr[i];
-            TORCH_CHECK(
-                idx >= 0 && idx < weight_c.size(0),
-                "nova_embedding: index out of range");
-            std::memcpy(
-                out_ptr + i * embedding_dim,
-                w_ptr + idx * embedding_dim,
-                static_cast<size_t>(embedding_dim) * sizeof(float));
+        // Indices can be Long or Int
+        if (indices_c.scalar_type() == at::ScalarType::Long) {
+            const int64_t* idx_ptr = static_cast<const int64_t*>(i_raw);
+            for (int64_t i = 0; i < num_indices; ++i) {
+                int64_t idx = idx_ptr[i];
+                TORCH_CHECK(
+                    idx >= 0 && idx < weight_c.size(0),
+                    "nova_embedding: index out of range");
+                std::memcpy(
+                    out_ptr + i * embedding_dim,
+                    w_ptr + idx * embedding_dim,
+                    static_cast<size_t>(embedding_dim) * sizeof(float));
+            }
+        } else if (indices_c.scalar_type() == at::ScalarType::Int) {
+            const int32_t* idx_ptr = static_cast<const int32_t*>(i_raw);
+            for (int64_t i = 0; i < num_indices; ++i) {
+                int64_t idx = static_cast<int64_t>(idx_ptr[i]);
+                TORCH_CHECK(
+                    idx >= 0 && idx < weight_c.size(0),
+                    "nova_embedding: index out of range");
+                std::memcpy(
+                    out_ptr + i * embedding_dim,
+                    w_ptr + idx * embedding_dim,
+                    static_cast<size_t>(embedding_dim) * sizeof(float));
+            }
+        } else {
+            TORCH_CHECK(false, "nova_embedding: indices must be Long or Int");
         }
-    } else if (indices_c.scalar_type() == at::ScalarType::Int) {
-        const int32_t* idx_ptr = static_cast<const int32_t*>(indices_c.data_ptr());
-        for (int64_t i = 0; i < num_indices; ++i) {
-            int64_t idx = static_cast<int64_t>(idx_ptr[i]);
-            TORCH_CHECK(
-                idx >= 0 && idx < weight_c.size(0),
-                "nova_embedding: index out of range");
-            std::memcpy(
-                out_ptr + i * embedding_dim,
-                w_ptr + idx * embedding_dim,
-                static_cast<size_t>(embedding_dim) * sizeof(float));
-        }
-    } else {
-        TORCH_CHECK(false, "nova_embedding: indices must be Long or Int");
-    }
+    });
+    });
+    });
 
-    novatorch::flushNovaBuffer(output);
     return output;
 }
 
@@ -135,45 +122,47 @@ at::Tensor nova_embedding_dense_backward(
     auto grad_c = grad_output.contiguous();
     auto indices_c = indices.contiguous();
 
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(grad_c);
-    novatorch::invalidateNovaBuffer(indices_c);
-
     int64_t embedding_dim = grad_c.size(grad_c.dim() - 1);
 
     // grad_weight shape: [num_weights, embedding_dim]
     auto grad_weight = at::zeros(
         {num_weights, embedding_dim}, grad_c.options());
 
-    float* gw_ptr = static_cast<float*>(grad_weight.data_ptr());
-    const float* go_ptr = static_cast<const float*>(grad_c.data_ptr());
     int64_t num_indices = indices_c.numel();
 
-    if (indices_c.scalar_type() == at::ScalarType::Long) {
-        const int64_t* idx_ptr =
-            static_cast<const int64_t*>(indices_c.data_ptr());
-        for (int64_t i = 0; i < num_indices; ++i) {
-            int64_t idx = idx_ptr[i];
-            if (idx == padding_idx) continue;
-            for (int64_t j = 0; j < embedding_dim; ++j) {
-                gw_ptr[idx * embedding_dim + j] +=
-                    go_ptr[i * embedding_dim + j];
-            }
-        }
-    } else {
-        const int32_t* idx_ptr =
-            static_cast<const int32_t*>(indices_c.data_ptr());
-        for (int64_t i = 0; i < num_indices; ++i) {
-            int64_t idx = static_cast<int64_t>(idx_ptr[i]);
-            if (idx == padding_idx) continue;
-            for (int64_t j = 0; j < embedding_dim; ++j) {
-                gw_ptr[idx * embedding_dim + j] +=
-                    go_ptr[i * embedding_dim + j];
-            }
-        }
-    }
+    novatorch::withStagingRead(grad_c, [&](const void* go_raw, size_t) {
+    novatorch::withStagingRead(indices_c, [&](const void* idx_raw, size_t) {
+    novatorch::withStagingReadWrite(grad_weight, [&](void* gw_raw, size_t) {
+        float* gw_ptr = static_cast<float*>(gw_raw);
+        const float* go_ptr = static_cast<const float*>(go_raw);
 
-    novatorch::flushNovaBuffer(grad_weight);
+        if (indices_c.scalar_type() == at::ScalarType::Long) {
+            const int64_t* idx_ptr =
+                static_cast<const int64_t*>(idx_raw);
+            for (int64_t i = 0; i < num_indices; ++i) {
+                int64_t idx = idx_ptr[i];
+                if (idx == padding_idx) continue;
+                for (int64_t j = 0; j < embedding_dim; ++j) {
+                    gw_ptr[idx * embedding_dim + j] +=
+                        go_ptr[i * embedding_dim + j];
+                }
+            }
+        } else {
+            const int32_t* idx_ptr =
+                static_cast<const int32_t*>(idx_raw);
+            for (int64_t i = 0; i < num_indices; ++i) {
+                int64_t idx = static_cast<int64_t>(idx_ptr[i]);
+                if (idx == padding_idx) continue;
+                for (int64_t j = 0; j < embedding_dim; ++j) {
+                    gw_ptr[idx * embedding_dim + j] +=
+                        go_ptr[i * embedding_dim + j];
+                }
+            }
+        }
+    });
+    });
+    });
+
     return grad_weight;
 }
 
@@ -213,38 +202,39 @@ at::Tensor nova_arange(
     auto output = at::empty({numel}, options);
     if (numel == 0) return output;
 
-    if (dtype == at::ScalarType::Float) {
-        float* ptr = static_cast<float*>(output.data_ptr());
-        float fs = static_cast<float>(s);
-        float fst = static_cast<float>(st);
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = fs + static_cast<float>(i) * fst;
+    novatorch::withStagingWrite(output, [&](void* raw, size_t) {
+        if (dtype == at::ScalarType::Float) {
+            float* ptr = static_cast<float*>(raw);
+            float fs = static_cast<float>(s);
+            float fst = static_cast<float>(st);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = fs + static_cast<float>(i) * fst;
+            }
+        } else if (dtype == at::ScalarType::Long) {
+            int64_t* ptr = static_cast<int64_t*>(raw);
+            int64_t is = static_cast<int64_t>(s);
+            int64_t ist = static_cast<int64_t>(st);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = is + i * ist;
+            }
+        } else if (dtype == at::ScalarType::Int) {
+            int32_t* ptr = static_cast<int32_t*>(raw);
+            int32_t is = static_cast<int32_t>(s);
+            int32_t ist = static_cast<int32_t>(st);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = is + static_cast<int32_t>(i) * ist;
+            }
+        } else if (dtype == at::ScalarType::Double) {
+            double* ptr = static_cast<double*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = s + static_cast<double>(i) * st;
+            }
+        } else {
+            TORCH_CHECK(false,
+                "nova_arange: unsupported dtype ", dtype);
         }
-    } else if (dtype == at::ScalarType::Long) {
-        int64_t* ptr = static_cast<int64_t*>(output.data_ptr());
-        int64_t is = static_cast<int64_t>(s);
-        int64_t ist = static_cast<int64_t>(st);
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = is + i * ist;
-        }
-    } else if (dtype == at::ScalarType::Int) {
-        int32_t* ptr = static_cast<int32_t*>(output.data_ptr());
-        int32_t is = static_cast<int32_t>(s);
-        int32_t ist = static_cast<int32_t>(st);
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = is + static_cast<int32_t>(i) * ist;
-        }
-    } else if (dtype == at::ScalarType::Double) {
-        double* ptr = static_cast<double*>(output.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = s + static_cast<double>(i) * st;
-        }
-    } else {
-        TORCH_CHECK(false,
-            "nova_arange: unsupported dtype ", dtype);
-    }
+    });
 
-    novatorch::flushNovaBuffer(output);
     return output;
 }
 
@@ -261,14 +251,11 @@ at::Tensor& nova_arange_out(
         out.device(),
         false);
 
-    // Resize out and copy
+    // Resize out and copy device-to-device
     out.resize_({result.numel()});
-    auto nbytes = result.numel() * result.element_size();
+    auto nbytes = static_cast<size_t>(result.numel() * result.element_size());
     if (nbytes > 0) {
-        novatorch::invalidateNovaBuffer(result);
-        std::memcpy(out.data_ptr(), result.data_ptr(),
-                     static_cast<size_t>(nbytes));
-        novatorch::flushNovaBuffer(out);
+        novatorch::copyDeviceToDevice(result, out, nbytes);
     }
     return out;
 }
@@ -300,30 +287,32 @@ std::tuple<at::Tensor, at::Tensor> nova_native_dropout(
     }
 
     auto input_c = input.contiguous();
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(input_c);
 
     int64_t numel = input_c.numel();
     auto output = at::empty(input_c.sizes(), input_c.options());
     auto mask = at::empty(input_c.sizes(),
         input_c.options().dtype(at::ScalarType::Bool));
 
-    const float* in_ptr = static_cast<const float*>(input_c.data_ptr());
-    float* out_ptr = static_cast<float*>(output.data_ptr());
-    bool* mask_ptr = static_cast<bool*>(mask.data_ptr());
+    novatorch::withStagingRead(input_c, [&](const void* in_raw, size_t) {
+    novatorch::withStagingWrite(output, [&](void* out_raw, size_t) {
+    novatorch::withStagingWrite(mask, [&](void* mask_raw, size_t) {
+        const float* in_ptr = static_cast<const float*>(in_raw);
+        float* out_ptr = static_cast<float*>(out_raw);
+        bool* mask_ptr = static_cast<bool*>(mask_raw);
 
-    std::mt19937 rng(std::random_device{}());
-    std::bernoulli_distribution dist(1.0 - p);
-    float scale = 1.0f / (1.0f - static_cast<float>(p));
+        std::mt19937 rng(std::random_device{}());
+        std::bernoulli_distribution dist(1.0 - p);
+        float scale = 1.0f / (1.0f - static_cast<float>(p));
 
-    for (int64_t i = 0; i < numel; ++i) {
-        bool keep = dist(rng);
-        mask_ptr[i] = keep;
-        out_ptr[i] = keep ? in_ptr[i] * scale : 0.0f;
-    }
+        for (int64_t i = 0; i < numel; ++i) {
+            bool keep = dist(rng);
+            mask_ptr[i] = keep;
+            out_ptr[i] = keep ? in_ptr[i] * scale : 0.0f;
+        }
+    });
+    });
+    });
 
-    novatorch::flushNovaBuffer(output);
-    novatorch::flushNovaBuffer(mask);
     return std::make_tuple(output, mask);
 }
 
@@ -343,30 +332,31 @@ at::Tensor& nova_bernoulli_float(
     int64_t numel = self.numel();
     if (numel == 0) return self;
 
-    std::mt19937 rng(std::random_device{}());
-    std::bernoulli_distribution dist(p);
+    novatorch::withStagingWrite(self, [&](void* raw, size_t) {
+        std::mt19937 rng(std::random_device{}());
+        std::bernoulli_distribution dist(p);
 
-    if (self.scalar_type() == at::ScalarType::Float) {
-        float* ptr = static_cast<float*>(self.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = dist(rng) ? 1.0f : 0.0f;
+        if (self.scalar_type() == at::ScalarType::Float) {
+            float* ptr = static_cast<float*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = dist(rng) ? 1.0f : 0.0f;
+            }
+        } else if (self.scalar_type() == at::ScalarType::Bool) {
+            bool* ptr = static_cast<bool*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = dist(rng);
+            }
+        } else if (self.scalar_type() == at::ScalarType::Double) {
+            double* ptr = static_cast<double*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                ptr[i] = dist(rng) ? 1.0 : 0.0;
+            }
+        } else {
+            TORCH_CHECK(false,
+                "nova_bernoulli_: unsupported dtype ", self.scalar_type());
         }
-    } else if (self.scalar_type() == at::ScalarType::Bool) {
-        bool* ptr = static_cast<bool*>(self.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = dist(rng);
-        }
-    } else if (self.scalar_type() == at::ScalarType::Double) {
-        double* ptr = static_cast<double*>(self.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            ptr[i] = dist(rng) ? 1.0 : 0.0;
-        }
-    } else {
-        TORCH_CHECK(false,
-            "nova_bernoulli_: unsupported dtype ", self.scalar_type());
-    }
+    });
 
-    novatorch::flushNovaBuffer(self);
     return self;
 }
 
@@ -376,8 +366,6 @@ at::Tensor& nova_bernoulli_float(
 
 at::Tensor nova_nonzero(const at::Tensor& self) {
     auto self_c = self.contiguous();
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(self_c);
 
     int64_t numel = self_c.numel();
     int64_t ndim = self_c.dim();
@@ -385,42 +373,41 @@ at::Tensor nova_nonzero(const at::Tensor& self) {
 
     auto sizes = self_c.sizes();
 
-    // First pass: count nonzero elements
+    // Download input to CPU, find nonzero indices
     std::vector<int64_t> nz_linear;
     nz_linear.reserve(static_cast<size_t>(numel));
 
-    if (self_c.scalar_type() == at::ScalarType::Float) {
-        const float* ptr = static_cast<const float*>(self_c.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            if (ptr[i] != 0.0f) nz_linear.push_back(i);
+    novatorch::withStagingRead(self_c, [&](const void* raw, size_t) {
+        if (self_c.scalar_type() == at::ScalarType::Float) {
+            const float* ptr = static_cast<const float*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                if (ptr[i] != 0.0f) nz_linear.push_back(i);
+            }
+        } else if (self_c.scalar_type() == at::ScalarType::Long) {
+            const int64_t* ptr = static_cast<const int64_t*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                if (ptr[i] != 0) nz_linear.push_back(i);
+            }
+        } else if (self_c.scalar_type() == at::ScalarType::Bool) {
+            const bool* ptr = static_cast<const bool*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                if (ptr[i]) nz_linear.push_back(i);
+            }
+        } else if (self_c.scalar_type() == at::ScalarType::Double) {
+            const double* ptr = static_cast<const double*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                if (ptr[i] != 0.0) nz_linear.push_back(i);
+            }
+        } else if (self_c.scalar_type() == at::ScalarType::Int) {
+            const int32_t* ptr = static_cast<const int32_t*>(raw);
+            for (int64_t i = 0; i < numel; ++i) {
+                if (ptr[i] != 0) nz_linear.push_back(i);
+            }
+        } else {
+            TORCH_CHECK(false,
+                "nova_nonzero: unsupported dtype ", self_c.scalar_type());
         }
-    } else if (self_c.scalar_type() == at::ScalarType::Long) {
-        const int64_t* ptr =
-            static_cast<const int64_t*>(self_c.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            if (ptr[i] != 0) nz_linear.push_back(i);
-        }
-    } else if (self_c.scalar_type() == at::ScalarType::Bool) {
-        const bool* ptr = static_cast<const bool*>(self_c.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            if (ptr[i]) nz_linear.push_back(i);
-        }
-    } else if (self_c.scalar_type() == at::ScalarType::Double) {
-        const double* ptr =
-            static_cast<const double*>(self_c.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            if (ptr[i] != 0.0) nz_linear.push_back(i);
-        }
-    } else if (self_c.scalar_type() == at::ScalarType::Int) {
-        const int32_t* ptr =
-            static_cast<const int32_t*>(self_c.data_ptr());
-        for (int64_t i = 0; i < numel; ++i) {
-            if (ptr[i] != 0) nz_linear.push_back(i);
-        }
-    } else {
-        TORCH_CHECK(false,
-            "nova_nonzero: unsupported dtype ", self_c.scalar_type());
-    }
+    });
 
     int64_t N = static_cast<int64_t>(nz_linear.size());
 
@@ -431,19 +418,19 @@ at::Tensor nova_nonzero(const at::Tensor& self) {
 
     if (N == 0) return output;
 
-    int64_t* out_ptr = static_cast<int64_t*>(output.data_ptr());
-
-    // Convert linear indices to multi-dim indices
-    for (int64_t i = 0; i < N; ++i) {
-        int64_t linear = nz_linear[i];
-        for (int64_t d = ndim - 1; d >= 0; --d) {
-            int64_t dim_size = (self_c.dim() == 0) ? 1 : sizes[d];
-            out_ptr[i * ndim + d] = linear % dim_size;
-            linear /= dim_size;
+    // Convert linear indices to multi-dim indices and upload
+    novatorch::withStagingWrite(output, [&](void* out_raw, size_t) {
+        int64_t* out_ptr = static_cast<int64_t*>(out_raw);
+        for (int64_t i = 0; i < N; ++i) {
+            int64_t linear = nz_linear[i];
+            for (int64_t d = ndim - 1; d >= 0; --d) {
+                int64_t dim_size = (self_c.dim() == 0) ? 1 : sizes[d];
+                out_ptr[i * ndim + d] = linear % dim_size;
+                linear /= dim_size;
+            }
         }
-    }
+    });
 
-    novatorch::flushNovaBuffer(output);
     return output;
 }
 
@@ -470,11 +457,6 @@ at::Tensor nova_scaled_dot_product_attention(
     auto K = key.contiguous();
     auto V = value.contiguous();
 
-    NovaBatchContext::instance().flush();
-    novatorch::invalidateNovaBuffer(Q);
-    novatorch::invalidateNovaBuffer(K);
-    novatorch::invalidateNovaBuffer(V);
-
     int64_t B = Q.size(0);
     int64_t H = Q.size(1);
     int64_t L = Q.size(2);
@@ -490,126 +472,148 @@ at::Tensor nova_scaled_dot_product_attention(
     int64_t Dv = V.size(3);
     auto output = at::empty({B, H, L, Dv}, Q.options());
 
-    const float* q_ptr = static_cast<const float*>(Q.data_ptr());
-    const float* k_ptr = static_cast<const float*>(K.data_ptr());
-    const float* v_ptr = static_cast<const float*>(V.data_ptr());
-    float* out_ptr = static_cast<float*>(output.data_ptr());
+    // Download Q, K, V to CPU-side buffers
+    auto q_nbytes = static_cast<size_t>(Q.numel() * Q.element_size());
+    auto k_nbytes = static_cast<size_t>(K.numel() * K.element_size());
+    auto v_nbytes = static_cast<size_t>(V.numel() * V.element_size());
+
+    std::vector<uint8_t> q_buf(q_nbytes);
+    std::vector<uint8_t> k_buf(k_nbytes);
+    std::vector<uint8_t> v_buf(v_nbytes);
+
+    novatorch::downloadFromDevice(Q, q_buf.data(), q_nbytes);
+    novatorch::downloadFromDevice(K, k_buf.data(), k_nbytes);
+    novatorch::downloadFromDevice(V, v_buf.data(), v_nbytes);
+
+    const float* q_ptr = reinterpret_cast<const float*>(q_buf.data());
+    const float* k_ptr = reinterpret_cast<const float*>(k_buf.data());
+    const float* v_ptr = reinterpret_cast<const float*>(v_buf.data());
 
     // Optional attention mask
-    const float* mask_ptr = nullptr;
+    std::vector<uint8_t> mask_buf;
+    const void* mask_raw = nullptr;
     at::Tensor mask_c;
     if (attn_mask.has_value() && attn_mask->defined()) {
         mask_c = attn_mask->contiguous();
-        novatorch::invalidateNovaBuffer(mask_c);
-        mask_ptr = static_cast<const float*>(mask_c.data_ptr());
+        auto m_nbytes = static_cast<size_t>(
+            mask_c.numel() * mask_c.element_size());
+        mask_buf.resize(m_nbytes);
+        novatorch::downloadFromDevice(mask_c, mask_buf.data(), m_nbytes);
+        mask_raw = mask_buf.data();
     }
 
-    // Temporary buffer for attention scores [L, S]
-    std::vector<float> attn_scores(static_cast<size_t>(L * S));
+    // Compute attention and upload result
+    novatorch::withStagingWrite(output, [&](void* out_raw, size_t) {
+        float* out_ptr = static_cast<float*>(out_raw);
 
-    for (int64_t b = 0; b < B; ++b) {
-        for (int64_t h = 0; h < H; ++h) {
-            int64_t qh_off = (b * H + h) * L * D;
-            int64_t kh_off = (b * H + h) * S * D;
-            int64_t vh_off = (b * H + h) * S * Dv;
-            int64_t oh_off = (b * H + h) * L * Dv;
+        // Temporary buffer for attention scores [L, S]
+        std::vector<float> attn_scores(static_cast<size_t>(L * S));
 
-            // Compute Q @ K^T * scale -> attn_scores [L, S]
-            for (int64_t i = 0; i < L; ++i) {
-                for (int64_t j = 0; j < S; ++j) {
-                    float dot = 0.0f;
-                    for (int64_t d = 0; d < D; ++d) {
-                        dot += q_ptr[qh_off + i * D + d] *
-                               k_ptr[kh_off + j * D + d];
-                    }
-                    attn_scores[static_cast<size_t>(i * S + j)] =
-                        dot * static_cast<float>(scale_val);
-                }
-            }
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t h = 0; h < H; ++h) {
+                int64_t qh_off = (b * H + h) * L * D;
+                int64_t kh_off = (b * H + h) * S * D;
+                int64_t vh_off = (b * H + h) * S * Dv;
+                int64_t oh_off = (b * H + h) * L * Dv;
 
-            // Apply causal mask: mask future positions with -inf
-            if (is_causal) {
+                // Compute Q @ K^T * scale -> attn_scores [L, S]
                 for (int64_t i = 0; i < L; ++i) {
-                    for (int64_t j = i + 1; j < S; ++j) {
+                    for (int64_t j = 0; j < S; ++j) {
+                        float dot = 0.0f;
+                        for (int64_t d = 0; d < D; ++d) {
+                            dot += q_ptr[qh_off + i * D + d] *
+                                   k_ptr[kh_off + j * D + d];
+                        }
                         attn_scores[static_cast<size_t>(i * S + j)] =
-                            -std::numeric_limits<float>::infinity();
+                            dot * static_cast<float>(scale_val);
                     }
                 }
-            }
 
-            // Apply explicit attention mask (additive)
-            if (mask_ptr) {
-                // Mask can be [L, S], [1, 1, L, S], [B, H, L, S], etc.
-                // For simplicity, assume broadcastable: use last 2 dims
-                int64_t mask_numel = mask_c.numel();
-                int64_t mask_ls = L * S;
-                int64_t mask_offset = 0;
-                if (mask_numel == mask_ls) {
-                    mask_offset = 0;
-                } else if (mask_numel == B * H * mask_ls) {
-                    mask_offset = (b * H + h) * mask_ls;
-                } else if (mask_numel == B * mask_ls) {
-                    mask_offset = b * mask_ls;
-                } else if (mask_numel == H * mask_ls) {
-                    mask_offset = h * mask_ls;
-                }
-                // Apply mask as additive (for float masks)
-                if (mask_c.scalar_type() == at::ScalarType::Float) {
-                    for (int64_t idx = 0; idx < mask_ls; ++idx) {
-                        attn_scores[static_cast<size_t>(idx)] +=
-                            mask_ptr[mask_offset + idx];
-                    }
-                } else if (mask_c.scalar_type() == at::ScalarType::Bool) {
-                    const bool* bmask =
-                        static_cast<const bool*>(mask_c.data_ptr());
-                    for (int64_t idx = 0; idx < mask_ls; ++idx) {
-                        if (!bmask[mask_offset + idx]) {
-                            attn_scores[static_cast<size_t>(idx)] =
+                // Apply causal mask: mask future positions with -inf
+                if (is_causal) {
+                    for (int64_t i = 0; i < L; ++i) {
+                        for (int64_t j = i + 1; j < S; ++j) {
+                            attn_scores[static_cast<size_t>(i * S + j)] =
                                 -std::numeric_limits<float>::infinity();
                         }
                     }
                 }
-            }
 
-            // Softmax over S dimension for each query position
-            for (int64_t i = 0; i < L; ++i) {
-                float max_val = -std::numeric_limits<float>::infinity();
-                for (int64_t j = 0; j < S; ++j) {
-                    float v = attn_scores[static_cast<size_t>(i * S + j)];
-                    if (v > max_val) max_val = v;
-                }
-                float sum = 0.0f;
-                for (int64_t j = 0; j < S; ++j) {
-                    float e = std::exp(
-                        attn_scores[static_cast<size_t>(i * S + j)] -
-                        max_val);
-                    attn_scores[static_cast<size_t>(i * S + j)] = e;
-                    sum += e;
-                }
-                if (sum > 0.0f) {
-                    float inv_sum = 1.0f / sum;
-                    for (int64_t j = 0; j < S; ++j) {
-                        attn_scores[static_cast<size_t>(i * S + j)] *=
-                            inv_sum;
+                // Apply explicit attention mask (additive)
+                if (mask_raw) {
+                    int64_t mask_numel = mask_c.numel();
+                    int64_t mask_ls = L * S;
+                    int64_t mask_offset = 0;
+                    if (mask_numel == mask_ls) {
+                        mask_offset = 0;
+                    } else if (mask_numel == B * H * mask_ls) {
+                        mask_offset = (b * H + h) * mask_ls;
+                    } else if (mask_numel == B * mask_ls) {
+                        mask_offset = b * mask_ls;
+                    } else if (mask_numel == H * mask_ls) {
+                        mask_offset = h * mask_ls;
+                    }
+                    if (mask_c.scalar_type() == at::ScalarType::Float) {
+                        const float* mask_ptr =
+                            static_cast<const float*>(mask_raw);
+                        for (int64_t idx = 0; idx < mask_ls; ++idx) {
+                            attn_scores[static_cast<size_t>(idx)] +=
+                                mask_ptr[mask_offset + idx];
+                        }
+                    } else if (mask_c.scalar_type() == at::ScalarType::Bool) {
+                        const bool* bmask =
+                            static_cast<const bool*>(mask_raw);
+                        for (int64_t idx = 0; idx < mask_ls; ++idx) {
+                            if (!bmask[mask_offset + idx]) {
+                                attn_scores[static_cast<size_t>(idx)] =
+                                    -std::numeric_limits<float>::infinity();
+                            }
+                        }
                     }
                 }
-            }
 
-            // Compute attn_scores @ V -> output [L, Dv]
-            for (int64_t i = 0; i < L; ++i) {
-                for (int64_t d = 0; d < Dv; ++d) {
-                    float acc = 0.0f;
+                // Softmax over S dimension for each query position
+                for (int64_t i = 0; i < L; ++i) {
+                    float max_val =
+                        -std::numeric_limits<float>::infinity();
                     for (int64_t j = 0; j < S; ++j) {
-                        acc +=
-                            attn_scores[static_cast<size_t>(i * S + j)] *
-                            v_ptr[vh_off + j * Dv + d];
+                        float v =
+                            attn_scores[static_cast<size_t>(i * S + j)];
+                        if (v > max_val) max_val = v;
                     }
-                    out_ptr[oh_off + i * Dv + d] = acc;
+                    float sum = 0.0f;
+                    for (int64_t j = 0; j < S; ++j) {
+                        float e = std::exp(
+                            attn_scores[static_cast<size_t>(i * S + j)] -
+                            max_val);
+                        attn_scores[static_cast<size_t>(i * S + j)] = e;
+                        sum += e;
+                    }
+                    if (sum > 0.0f) {
+                        float inv_sum = 1.0f / sum;
+                        for (int64_t j = 0; j < S; ++j) {
+                            attn_scores[static_cast<size_t>(i * S + j)] *=
+                                inv_sum;
+                        }
+                    }
+                }
+
+                // Compute attn_scores @ V -> output [L, Dv]
+                for (int64_t i = 0; i < L; ++i) {
+                    for (int64_t d = 0; d < Dv; ++d) {
+                        float acc = 0.0f;
+                        for (int64_t j = 0; j < S; ++j) {
+                            acc +=
+                                attn_scores[static_cast<size_t>(
+                                    i * S + j)] *
+                                v_ptr[vh_off + j * Dv + d];
+                        }
+                        out_ptr[oh_off + i * Dv + d] = acc;
+                    }
                 }
             }
         }
-    }
+    });
 
-    novatorch::flushNovaBuffer(output);
     return output;
 }
