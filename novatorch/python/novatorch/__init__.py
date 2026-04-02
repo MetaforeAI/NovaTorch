@@ -39,13 +39,23 @@ _C.set_log_level(_log_level)
 # Rename PrivateUse1 to "nova"
 torch.utils.rename_privateuse1_backend("nova")
 
-# PyTorch 2.10+ tries to `import torch.<backend>` when a custom device is used.
+# PyTorch 2.10+ and torch.compile need `torch.nova` as a proper module
+# attribute (getattr(torch, "nova")) not just in sys.modules.
 _nova_mod = types.ModuleType("torch.nova")
 _nova_mod.__package__ = "torch"
+_nova_mod.is_available = lambda: _C.device_count() > 0
+_nova_mod.device_count = lambda: _C.device_count()
+_nova_mod.current_device = lambda: 0
+_nova_mod.synchronize = lambda: _C.synchronize()
 sys.modules["torch.nova"] = _nova_mod
+torch.nova = _nova_mod  # make getattr(torch, "nova") work
 
 # Generate .nova(), .is_nova, etc. methods on Tensor and Module
 torch.utils.generate_methods_for_privateuse1_backend()
+
+
+# Register torch.compile backends ("nova" and "nova_aot")
+import novatorch.compiler  # noqa: E402,F401
 
 
 def is_available() -> bool:
