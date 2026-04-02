@@ -10,9 +10,10 @@ void dispatchCompute(
     const VkDeviceSize* buffer_sizes,
     uint32_t groups_x,
     uint32_t groups_y,
-    uint32_t groups_z)
+    uint32_t groups_z,
+    std::initializer_list<at::Tensor> retain)
 {
     NovaBatchContext::instance().recordDispatch(
         kernel_name, num_buffers, push_constant_size, push_data,
-        buffers, buffer_sizes, groups_x, groups_y, groups_z);
+        buffers, buffer_sizes, groups_x, groups_y, groups_z, retain);
 }

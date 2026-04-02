@@ -64,6 +64,9 @@ void NovaBatchContext::flush() {
     // Reset descriptor pool for next batch
     desc_pool_->reset();
 
+    // Release retained tensors — GPU is done, buffers are safe to free
+    retained_.clear();
+
     recording_ = false;
     dispatch_count_ = 0;
 }
@@ -81,7 +84,8 @@ void NovaBatchContext::recordDispatch(
     const VkDeviceSize* buffer_sizes,
     uint32_t groups_x,
     uint32_t groups_y,
-    uint32_t groups_z)
+    uint32_t groups_z,
+    std::initializer_list<at::Tensor> retain)
 {
     if (!enabled_) {
         // Fallback: synchronous dispatch via executeCompute
@@ -152,6 +156,11 @@ void NovaBatchContext::recordDispatch(
         vkCmdPushConstants(cmd, pi.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, push_constant_size, push_data);
     vkCmdDispatch(cmd, groups_x, groups_y, groups_z);
+
+    // Retain tensors to prevent use-after-free during batch lifetime
+    for (const auto& t : retain) {
+        retained_.push_back(t);
+    }
 
     // Compute-to-compute barrier between dispatches
     VkMemoryBarrier barrier{};

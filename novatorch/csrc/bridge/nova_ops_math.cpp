@@ -64,7 +64,8 @@ at::Tensor dispatch_unary_math(
     PCNumel pc{numel};
 
     dispatchCompute(kernel_name, 2, sizeof(pc), &pc, bufs, sizes,
-                    divUp(numel, WG_SIZE));
+                    divUp(numel, WG_SIZE), 1, 1,
+                    {self, output});
     return output;
 }
 
@@ -129,7 +130,8 @@ at::Tensor nova_pow_tensor_scalar(
     PCPow pc{numel, exponent.toFloat()};
 
     dispatchCompute("math_pow", 2, sizeof(pc), &pc, bufs, sizes,
-                    divUp(numel, WG_SIZE));
+                    divUp(numel, WG_SIZE), 1, 1,
+                    {self, output});
     return output;
 }
 
@@ -164,7 +166,8 @@ at::Tensor nova_max_other(
     PCNumel pc{numel};
 
     dispatchCompute("math_max", 3, sizeof(pc), &pc, bufs, sizes,
-                    divUp(numel, WG_SIZE));
+                    divUp(numel, WG_SIZE), 1, 1,
+                    {self, other, output});
     return output;
 }
 
@@ -195,7 +198,8 @@ at::Tensor nova_min_other(
     PCNumel pc{numel};
 
     dispatchCompute("math_min", 3, sizeof(pc), &pc, bufs, sizes,
-                    divUp(numel, WG_SIZE));
+                    divUp(numel, WG_SIZE), 1, 1,
+                    {self, other, output});
     return output;
 }
 
@@ -238,7 +242,8 @@ at::Tensor nova_clamp(
     pc.has_max = max_val.has_value() ? 1 : 0;
 
     dispatchCompute("clamp", 2, sizeof(pc), &pc, bufs, sizes,
-                    divUp(numel, WG_SIZE));
+                    divUp(numel, WG_SIZE), 1, 1,
+                    {self, output});
     return output;
 }
 

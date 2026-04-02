@@ -202,7 +202,8 @@ at::Tensor& nova_fill_scalar(at::Tensor& self, const at::Scalar& value) {
                     /*push_constant_size=*/sizeof(pc),
                     /*push_data=*/&pc,
                     &buf, &buf_size,
-                    groups);
+                    groups, 1, 1,
+                    {self});
     return self;
 }
 
@@ -226,7 +227,8 @@ at::Tensor& nova_zero_(at::Tensor& self) {
                     /*push_constant_size=*/sizeof(pc),
                     /*push_data=*/&pc,
                     &buf, &buf_size,
-                    groups);
+                    groups, 1, 1,
+                    {self});
     return self;
 }
 

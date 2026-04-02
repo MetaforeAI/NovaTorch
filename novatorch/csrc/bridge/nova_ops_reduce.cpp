@@ -36,7 +36,8 @@ at::Tensor nova_sum(
         static_cast<VkDeviceSize>(out_alloc->size)
     };
 
-    dispatchCompute("reduce_sum", 2, sizeof(pc), &pc, bufs, sizes, num_groups);
+    dispatchCompute("reduce_sum", 2, sizeof(pc), &pc, bufs, sizes, num_groups,
+                    1, 1, {self_c, partial});
 
     // Iterative reduction until single workgroup remains
     uint32_t remaining = num_groups;
@@ -56,7 +57,8 @@ at::Tensor nova_sum(
         };
 
         dispatchCompute("reduce_sum", 2, sizeof(iter_pc), &iter_pc,
-                        iter_bufs, iter_sizes, next_groups);
+                        iter_bufs, iter_sizes, next_groups, 1, 1,
+                        {partial, next});
 
         partial = next;
         remaining = next_groups;

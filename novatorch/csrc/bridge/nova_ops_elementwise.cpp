@@ -80,7 +80,8 @@ at::Tensor nova_add_tensor(
     VkDeviceSize sizes[3] = {alloc_a->size, alloc_b->size, alloc_out->size};
 
     dispatchCompute("elementwise_add", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self_c, other_c, output});
     return output;
 }
 
@@ -134,7 +135,8 @@ at::Tensor nova_sub_tensor(
     VkDeviceSize sizes[3] = {alloc_a->size, alloc_b->size, alloc_out->size};
 
     dispatchCompute("elementwise_sub", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self_c, other_c, output});
     return output;
 }
 
@@ -180,7 +182,8 @@ at::Tensor nova_mul_tensor(
     VkDeviceSize sizes[3] = {alloc_a->size, alloc_b->size, alloc_out->size};
 
     dispatchCompute("elementwise_mul", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self_c, other_c, output});
     return output;
 }
 
@@ -226,7 +229,8 @@ at::Tensor nova_div_tensor(
     VkDeviceSize sizes[3] = {alloc_a->size, alloc_b->size, alloc_out->size};
 
     dispatchCompute("elementwise_div", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self_c, other_c, output});
     return output;
 }
 
@@ -260,7 +264,8 @@ at::Tensor nova_mul_scalar(
     VkBuffer bufs[1] = {alloc_out->buffer};
     VkDeviceSize sizes[1] = {alloc_out->size};
     dispatchCompute("mul_scalar", 1, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {output});
     return output;
 }
 
@@ -309,7 +314,8 @@ at::Tensor nova_neg(const at::Tensor& self) {
     VkDeviceSize sizes[2] = {alloc_a->size, alloc_out->size};
 
     dispatchCompute("elementwise_neg", 2, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, output});
     return output;
 }
 

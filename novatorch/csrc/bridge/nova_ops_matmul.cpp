@@ -67,7 +67,8 @@ at::Tensor nova_mm(
 
 
     dispatchCompute(
-        "matmul", 3, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y);
+        "matmul", 3, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y, 1,
+        {self_c, mat2_c, output});
 
     return output;
 }
@@ -160,7 +161,8 @@ at::Tensor nova_addmm(
 
 
     dispatchCompute(
-        "addmm", 4, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y);
+        "addmm", 4, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y, 1,
+        {self_c, mat1_c, mat2_c, output});
 
     return output;
 }
@@ -236,7 +238,8 @@ at::Tensor nova_bmm(
 
 
     dispatchCompute(
-        "bmm", 3, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y, groups_z);
+        "bmm", 3, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y, groups_z,
+        {self_c2, mat2_c2, output});
 
     return output;
 }

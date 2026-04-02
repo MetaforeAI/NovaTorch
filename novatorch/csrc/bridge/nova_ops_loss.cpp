@@ -95,7 +95,8 @@ at::Tensor nova_softmax(
     // One workgroup per row
     uint32_t num_rows = outer_size * inner_size;
 
-    dispatchCompute("softmax", 2, sizeof(pc), &pc, bufs, sizes, num_rows);
+    dispatchCompute("softmax", 2, sizeof(pc), &pc, bufs, sizes, num_rows, 1, 1,
+                    {self, output});
     return output;
 }
 
@@ -139,7 +140,8 @@ at::Tensor nova_log_softmax(
     PCSoftmax pc{outer_size, dim_size, inner_size};
     uint32_t num_rows = outer_size * inner_size;
 
-    dispatchCompute("log_softmax", 2, sizeof(pc), &pc, bufs, sizes, num_rows);
+    dispatchCompute("log_softmax", 2, sizeof(pc), &pc, bufs, sizes, num_rows,
+                    1, 1, {self, output});
     return output;
 }
 
@@ -208,10 +210,12 @@ std::tuple<at::Tensor, at::Tensor> nova_nll_loss_forward(
     if (reduction == 0) {
         // No reduction: dispatch one thread per batch element
         dispatchCompute("nll_loss", 3, sizeof(pc), &pc, bufs, buf_sizes,
-                        divUp(batch_size, WG_SIZE));
+                        divUp(batch_size, WG_SIZE), 1, 1,
+                        {self, target, output});
     } else {
         // Reduction: single workgroup
-        dispatchCompute("nll_loss", 3, sizeof(pc), &pc, bufs, buf_sizes, 1);
+        dispatchCompute("nll_loss", 3, sizeof(pc), &pc, bufs, buf_sizes, 1,
+                        1, 1, {self, target, output});
     }
 
     // Compute total_weight on CPU (count of non-ignored samples)

@@ -57,7 +57,8 @@ static at::Tensor dispatch_elementwise_activation(
     constexpr uint32_t WG_SIZE = 256;
     uint32_t groups = (numel + WG_SIZE - 1) / WG_SIZE;
 
-    dispatchCompute(kernel_name, 2, sizeof(pc), &pc, bufs, sizes, groups);
+    dispatchCompute(kernel_name, 2, sizeof(pc), &pc, bufs, sizes, groups, 1, 1,
+                    {self, output});
 
     return output;
 }
@@ -141,7 +142,8 @@ at::Tensor nova_threshold_backward(
 
 
     dispatchCompute(
-        "threshold_backward", 3, sizeof(pc), &pc, bufs, sizes, groups);
+        "threshold_backward", 3, sizeof(pc), &pc, bufs, sizes, groups, 1, 1,
+        {grad_output, self, grad_input});
 
     return grad_input;
 }

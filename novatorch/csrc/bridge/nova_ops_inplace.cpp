@@ -177,7 +177,8 @@ at::Tensor& nova_add_inplace(
         alloc_self->size, alloc_other->size, alloc_self->size};
 
     dispatchCompute("elementwise_add", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, other_c});
     return self;
 }
 
@@ -219,7 +220,8 @@ at::Tensor& nova_sub_inplace(
         alloc_self->size, alloc_other->size, alloc_self->size};
 
     dispatchCompute("elementwise_sub", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, other_c});
     return self;
 }
 
@@ -242,7 +244,8 @@ at::Tensor& nova_mul_inplace_tensor(
         VkBuffer bufs[1] = {alloc_self->buffer};
         VkDeviceSize sizes_arr[1] = {alloc_self->size};
         dispatchCompute("mul_scalar", 1, sizeof(pc), &pc, bufs, sizes_arr,
-                        divRoundUp(numel, kWorkgroupSize));
+                        divRoundUp(numel, kWorkgroupSize), 1, 1,
+                        {self});
         return self;
     }
 
@@ -261,7 +264,8 @@ at::Tensor& nova_mul_inplace_tensor(
         alloc_self->size, alloc_other->size, alloc_self->size};
 
     dispatchCompute("elementwise_mul", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, other_c});
     return self;
 }
 
@@ -284,7 +288,8 @@ at::Tensor& nova_mul_inplace_scalar(
     VkDeviceSize sizes_arr[1] = {alloc_self->size};
 
     dispatchCompute("mul_scalar", 1, sizeof(pc), &pc, bufs, sizes_arr,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self});
     return self;
 }
 
@@ -326,7 +331,8 @@ at::Tensor& nova_div_inplace_tensor(
         alloc_self->size, alloc_other->size, alloc_self->size};
 
     dispatchCompute("elementwise_div", 3, sizeof(pc), &pc, bufs, sizes,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, other_c});
     return self;
 }
 
@@ -360,7 +366,8 @@ at::Tensor& nova_addcmul_inplace(
         alloc_self->size, alloc_t1->size, alloc_t2->size};
 
     dispatchCompute("addcmul", 3, sizeof(pc), &pc, bufs, sizes_arr,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, tensor1, tensor2});
     return self;
 }
 
@@ -394,6 +401,7 @@ at::Tensor& nova_addcdiv_inplace(
         alloc_self->size, alloc_t1->size, alloc_t2->size};
 
     dispatchCompute("addcdiv", 3, sizeof(pc), &pc, bufs, sizes_arr,
-                    divRoundUp(numel, kWorkgroupSize));
+                    divRoundUp(numel, kWorkgroupSize), 1, 1,
+                    {self, tensor1, tensor2});
     return self;
 }

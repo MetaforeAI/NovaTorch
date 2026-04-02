@@ -31,7 +31,8 @@ public:
         const VkDeviceSize* buffer_sizes,
         uint32_t groups_x,
         uint32_t groups_y = 1,
-        uint32_t groups_z = 1);
+        uint32_t groups_z = 1,
+        std::initializer_list<at::Tensor> retain = {});
 
     void flush();
     bool hasPending() const;
@@ -52,4 +53,10 @@ private:
     bool recording_     = false;
     bool enabled_       = true;
     uint32_t dispatch_count_ = 0;
+
+    // Tensors retained by the current batch. Prevents use-after-free:
+    // if Python GC destroys a tensor while the batch is pending, the
+    // at::Tensor refcount keeps the underlying VkBuffer alive until
+    // flush() completes and the GPU is done with the command buffer.
+    std::vector<at::Tensor> retained_;
 };
