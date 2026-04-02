@@ -23,13 +23,11 @@ public:
     explicit NovaCommandBatch(NovaCompute& compute);
     ~NovaCommandBatch();
 
-    // Non-copyable, non-movable (holds mutex reference)
+    // Non-copyable, non-movable
     NovaCommandBatch(const NovaCommandBatch&) = delete;
     NovaCommandBatch& operator=(const NovaCommandBatch&) = delete;
 
-    // Begin recording into the command buffer.
-    // Acquires the compute mutex — no other compute work can run until
-    // submit() or submitAsync()+wait() completes.
+    // Begin recording into the calling thread's command buffer.
     void begin();
 
     // Record a compute dispatch (pipeline bind + descriptor bind + dispatch)

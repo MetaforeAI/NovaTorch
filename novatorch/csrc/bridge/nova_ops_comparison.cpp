@@ -54,7 +54,6 @@ at::Tensor dispatch_comparison(
 
     PCCompare pc{numel, other.toFloat()};
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute(kernel_name, 2, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;
@@ -132,9 +131,6 @@ at::Tensor nova_where_self(
 
     PCNumel pc{numel};
 
-    novatorch::flushNovaBuffer(condition);
-    novatorch::flushNovaBuffer(self);
-    novatorch::flushNovaBuffer(other);
     dispatchCompute("where", 4, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE));
     return output;

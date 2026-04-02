@@ -1,92 +1,83 @@
 #pragma once
 #include "./core_base.h"
 #include <mutex>
+#include <thread>
+#include <unordered_map>
 
 /**
  * NovaCompute - Compute-only mode
  *
- * Lightweight Vulkan context for GPU compute operations:
- * - No surface/swapchain
- * - No graphics pipeline
- * - Minimal overhead
+ * Lightweight Vulkan context for GPU compute operations.
+ * Supports per-thread command buffer recording for concurrent use
+ * by PyTorch's autograd engine (which runs backward ops on a
+ * separate thread).
  *
- * Use for:
- * - FFT computations (Logos encoding)
- * - Triplanar projections
- * - General GPU compute tasks
+ * Thread model:
+ *   - Each thread gets its own VkCommandPool + VkCommandBuffer + VkFence.
+ *   - Recording into command buffers is lock-free (no mutex).
+ *   - vkQueueSubmit is serialized via a lightweight submit mutex.
+ *   - Fence waits are per-thread (block only the calling thread).
  */
 class NovaCompute : public NovaCore {
-private:
-    // Serializes all command buffer access — held from submit through wait.
-    // submitCompute() acquires, waitCompute() releases.
-    // executeCompute() holds for full duration.
-    std::mutex compute_mutex_;
-    std::unique_lock<std::mutex> submit_lock_;  // Held between submit and wait
-
-    // Compute-specific resources
-    VkCommandBuffer compute_cmd = VK_NULL_HANDLE;
-    VkFence compute_fence = VK_NULL_HANDLE;
-
 public:
-    /**
-     * Constructor - Initialize compute-only mode
-     * @param debug_level Logging level (INFO, DEBUG, VERBOSE, etc.)
-     */
-    NovaCompute(const std::string& debug_level);
+    /// Per-thread Vulkan resources. Each thread that dispatches GPU work
+    /// gets its own isolated set — no cross-thread contention during recording.
+    struct ThreadResources {
+        VkCommandPool pool   = VK_NULL_HANDLE;
+        VkCommandBuffer cmd  = VK_NULL_HANDLE;
+        VkFence fence        = VK_NULL_HANDLE;
+        bool fence_submitted = false;
+    };
 
-    /**
-     * Destructor - Cleanup compute resources
-     */
+    NovaCompute(const std::string& debug_level);
     ~NovaCompute() override;
 
-    /**
-     * Execute compute commands and wait for completion
-     * @param func Lambda receiving VkCommandBuffer for recording commands
-     */
+    // -----------------------------------------------------------------
+    // Per-thread resource management
+    // -----------------------------------------------------------------
+
+    /// Get or lazily create Vulkan resources for the calling thread.
+    ThreadResources& getThreadResources();
+
+    /// Submit a pre-recorded command buffer to the compute queue.
+    /// Acquires submit_mutex_ only for the vkQueueSubmit call itself.
+    void submitToQueue(VkCommandBuffer cmd, VkFence fence);
+
+    /// Block until a fence signals. No mutex held — thread-safe.
+    void waitForFence(VkFence fence);
+
+    /// Destroy resources for the calling thread.
+    void releaseThreadResources();
+
+    /// Destroy resources for ALL threads (shutdown).
+    void releaseAllThreadResources();
+
+    // -----------------------------------------------------------------
+    // Legacy synchronous API (uses calling thread's resources)
+    // -----------------------------------------------------------------
+
+    /// Record + submit + wait, all in one call.
     void executeCompute(std::function<void(VkCommandBuffer)>&& func);
 
-    /**
-     * Submit compute commands without waiting (async)
-     * @param func Lambda receiving VkCommandBuffer for recording commands
-     */
-    void submitCompute(std::function<void(VkCommandBuffer)>&& func);
-
-    /**
-     * Non-blocking check if submitted compute work is complete
-     */
-    bool isComputeComplete() const;
-
-    /**
-     * Block until submitted compute work completes
-     */
-    void waitCompute();
-
-    /**
-     * Wait for all device operations to complete
-     */
+    /// Wait for all device operations to complete.
     void waitIdle();
 
-    /**
-     * Get the compute command buffer (for manual recording)
-     */
-    VkCommandBuffer getComputeCommandBuffer() const { return compute_cmd; }
+    // -----------------------------------------------------------------
+    // Accessors
+    // -----------------------------------------------------------------
 
-    /**
-     * Begin batch recording: acquires compute mutex, resets fence and
-     * command buffer, begins recording. The mutex is held until
-     * endBatch() or endBatchAsync()+waitCompute() releases it.
-     */
-    void beginBatch();
+    VkDevice getDevice() const { return logical_device; }
+    VkPhysicalDevice getPhysicalDevice() const { return physical_device; }
+    VmaAllocator getAllocator() const { return allocator; }
 
-    /**
-     * End batch: ends command buffer, submits to compute queue,
-     * waits for completion, releases the compute mutex.
-     */
-    void endBatch();
+private:
+    // Serializes vkQueueSubmit calls only — NOT held during recording or wait.
+    std::mutex submit_mutex_;
 
-    /**
-     * End batch async: ends command buffer and submits without waiting.
-     * The compute mutex remains held until waitCompute() is called.
-     */
-    void endBatchAsync();
+    // Per-thread resources, tracked for cleanup at shutdown.
+    std::mutex thread_map_mutex_;
+    std::unordered_map<std::thread::id,
+                       std::unique_ptr<ThreadResources>> thread_resources_;
+
+    ThreadResources* createThreadResources();
 };

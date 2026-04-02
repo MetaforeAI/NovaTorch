@@ -65,8 +65,6 @@ at::Tensor nova_mm(
     uint32_t groups_x = (N + TILE - 1) / TILE;
     uint32_t groups_y = (M + TILE - 1) / TILE;
 
-    novatorch::flushNovaBuffer(self_c);
-    novatorch::flushNovaBuffer(mat2_c);
 
     dispatchCompute(
         "matmul", 3, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y);
@@ -160,9 +158,6 @@ at::Tensor nova_addmm(
     uint32_t groups_x = (N + TILE - 1) / TILE;
     uint32_t groups_y = (M + TILE - 1) / TILE;
 
-    novatorch::flushNovaBuffer(self_c);
-    novatorch::flushNovaBuffer(mat1_c);
-    novatorch::flushNovaBuffer(mat2_c);
 
     dispatchCompute(
         "addmm", 4, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y);
@@ -239,8 +234,6 @@ at::Tensor nova_bmm(
     uint32_t groups_y = (M + TILE - 1) / TILE;
     uint32_t groups_z = B;
 
-    novatorch::flushNovaBuffer(self_c2);
-    novatorch::flushNovaBuffer(mat2_c2);
 
     dispatchCompute(
         "bmm", 3, sizeof(pc), &pc, bufs, sizes, groups_x, groups_y, groups_z);

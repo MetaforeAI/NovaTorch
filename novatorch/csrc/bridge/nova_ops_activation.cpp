@@ -57,7 +57,6 @@ static at::Tensor dispatch_elementwise_activation(
     constexpr uint32_t WG_SIZE = 256;
     uint32_t groups = (numel + WG_SIZE - 1) / WG_SIZE;
 
-    novatorch::flushNovaBuffer(self);
     dispatchCompute(kernel_name, 2, sizeof(pc), &pc, bufs, sizes, groups);
 
     return output;
@@ -140,8 +139,6 @@ at::Tensor nova_threshold_backward(
     constexpr uint32_t WG_SIZE = 256;
     uint32_t groups = (numel + WG_SIZE - 1) / WG_SIZE;
 
-    novatorch::flushNovaBuffer(grad_output);
-    novatorch::flushNovaBuffer(self);
 
     dispatchCompute(
         "threshold_backward", 3, sizeof(pc), &pc, bufs, sizes, groups);
