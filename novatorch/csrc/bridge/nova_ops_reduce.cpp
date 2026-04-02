@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 #include <cstring>
 
 // ---------------------------------------------------------------------------
@@ -62,7 +63,8 @@ at::Tensor nova_sum(
         remaining = next_groups;
     }
 
-    // Read result from mapped memory
+    // Flush batched dispatches before reading result from mapped memory
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(partial);
     float result = *static_cast<float*>(partial.data_ptr());
 
@@ -90,6 +92,7 @@ at::Tensor nova_mean(
 
     at::Tensor sum_result = nova_sum(self, dtype);
 
+    // nova_sum already flushed; invalidate to read back
     novatorch::invalidateNovaBuffer(sum_result);
     float sum_val = *static_cast<float*>(sum_result.data_ptr());
     float mean_val = sum_val / static_cast<float>(self.numel());
@@ -221,6 +224,7 @@ at::Tensor nova_cat(const at::ITensorListRef& tensors, int64_t dim) {
     // For general case, use element-by-element copy via CPU fallback
     if (dim == 0) {
         // Fast path for dim=0 concat of contiguous tensors
+        NovaBatchContext::instance().flush();
         float* dst = static_cast<float*>(output.data_ptr());
         int64_t offset = 0;
         for (size_t i = 0; i < materialized.size(); ++i) {

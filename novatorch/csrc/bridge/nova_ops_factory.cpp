@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
@@ -189,6 +190,7 @@ at::Tensor& nova_fill_scalar(at::Tensor& self, const at::Scalar& value) {
     auto numel = static_cast<uint32_t>(self.numel());
     if (numel == 0) return self;
 
+    NovaBatchContext::instance().flush();
     // For mapped memory, just write directly from CPU
     float val = value.toFloat();
     float* ptr = static_cast<float*>(self.data_ptr());
@@ -206,6 +208,7 @@ at::Tensor& nova_fill_scalar(at::Tensor& self, const at::Scalar& value) {
 at::Tensor& nova_zero_(at::Tensor& self) {
     auto nbytes = self.numel() * self.element_size();
     if (nbytes == 0) return self;
+    NovaBatchContext::instance().flush();
     std::memset(self.data_ptr(), 0, static_cast<size_t>(nbytes));
     novatorch::flushNovaBuffer(self);
     return self;
@@ -395,12 +398,11 @@ at::Tensor nova_expand(
 at::Tensor nova_view(
     const at::Tensor& self, c10::IntArrayRef size) {
 
-    TORCH_CHECK(
-        is_contiguous(self),
-        "nova_view: only contiguous tensors are supported");
+    // Make contiguous if needed (einsum and transpose produce non-contiguous views)
+    at::Tensor input = is_contiguous(self) ? self : self.contiguous();
 
     // Resolve -1 dimension
-    int64_t numel = self.numel();
+    int64_t numel = input.numel();
     std::vector<int64_t> new_sizes(size.begin(), size.end());
     int64_t neg_idx = -1;
     int64_t product = 1;
@@ -430,7 +432,7 @@ at::Tensor nova_view(
         "] is invalid for input of size ", numel);
 
     auto new_strides = contiguous_strides(new_sizes);
-    return make_view(self, new_sizes, new_strides, self.storage_offset());
+    return make_view(input, new_sizes, new_strides, input.storage_offset());
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +594,7 @@ at::Tensor nova_contiguous(
     // Allocate new contiguous tensor and copy
     at::Tensor output = at::empty(self.sizes(), self.options());
     // Use memcpy for contiguous -> contiguous (self might be non-contiguous)
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self);
     auto numel = self.numel();
     if (numel == 0) return output;
@@ -647,6 +650,7 @@ at::Tensor nova_clone(
             at::Tensor output = at::empty(self.sizes(), self.options());
             auto nbytes = self.numel() * self.element_size();
             if (nbytes > 0) {
+                NovaBatchContext::instance().flush();
                 std::memcpy(output.data_ptr(), self.data_ptr(),
                             static_cast<size_t>(nbytes));
                 novatorch::flushNovaBuffer(output);
@@ -771,6 +775,7 @@ at::Tensor& nova_uniform_(
     std::uniform_real_distribution<float> dist(
         static_cast<float>(from), static_cast<float>(to));
 
+    NovaBatchContext::instance().flush();
     float* ptr = static_cast<float*>(self.data_ptr());
     for (int64_t i = 0; i < numel; ++i) {
         ptr[i] = dist(rng);
@@ -796,6 +801,7 @@ at::Tensor& nova_normal_(
     std::normal_distribution<float> dist(
         static_cast<float>(mean), static_cast<float>(std_val));
 
+    NovaBatchContext::instance().flush();
     float* ptr = static_cast<float*>(self.data_ptr());
     for (int64_t i = 0; i < numel; ++i) {
         ptr[i] = dist(rng);

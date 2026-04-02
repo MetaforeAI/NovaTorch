@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 #include <cstring>
 #include <vector>
@@ -59,6 +60,7 @@ at::Tensor& nova_copy_inplace(
     if (self_nova && src_nova) {
         if (src.is_contiguous() && src.storage().nbytes() >= tensorBytes(self)) {
             // Nova -> Nova: GPU-side vkCmdCopyBuffer (contiguous, sufficient storage)
+            NovaBatchContext::instance().flush();
             VkBuffer src_buf = novatorch::getNovaBuffer(src);
             VkBuffer dst_buf = novatorch::getNovaBuffer(self);
             VkDeviceSize copy_size =
@@ -74,8 +76,7 @@ at::Tensor& nova_copy_inplace(
         } else {
             // Non-contiguous source (e.g. expanded view): element-wise copy
             // through mapped memory. Both buffers are host-mapped.
-            // We read element-by-element from src using its strides,
-            // and write contiguously into dst.
+            NovaBatchContext::instance().flush();
             novatorch::invalidateNovaBuffer(src);
             auto* alloc_src = novatorch::getNovaAllocation(src);
             auto* alloc_dst = novatorch::getNovaAllocation(self);
@@ -116,7 +117,8 @@ at::Tensor& nova_copy_inplace(
     }
 
     if (src_nova && !self_nova) {
-        // Nova -> CPU: invalidate + memcpy
+        // Nova -> CPU: flush pending GPU work, then invalidate + memcpy
+        NovaBatchContext::instance().flush();
         novatorch::invalidateNovaBuffer(src);
         auto* alloc = novatorch::getNovaAllocation(src);
         if (src.is_contiguous() && src.storage().nbytes() >= tensorBytes(self)) {
@@ -160,6 +162,7 @@ at::Tensor& nova_add_inplace(
 
     // Scalar broadcast: handle via mapped memory
     if (other.numel() == 1) {
+        NovaBatchContext::instance().flush();
         float val = alpha.toFloat() * other.item<float>();
         novatorch::invalidateNovaBuffer(self);
         float* ptr = static_cast<float*>(
@@ -205,6 +208,7 @@ at::Tensor& nova_sub_inplace(
     const at::Scalar& alpha) {
 
     if (other.numel() == 1) {
+        NovaBatchContext::instance().flush();
         float val = alpha.toFloat() * other.item<float>();
         novatorch::invalidateNovaBuffer(self);
         float* ptr = static_cast<float*>(
@@ -312,6 +316,9 @@ at::Tensor& nova_div_inplace_tensor(
     const at::Tensor& other) {
 
     if (other.numel() == 1) {
+        // other.item() triggers flush via local_scalar_dense;
+        // but we also need self's data flushed before reading
+        NovaBatchContext::instance().flush();
         float val = other.item<float>();
         float inv = 1.0f / val;
         novatorch::invalidateNovaBuffer(self);

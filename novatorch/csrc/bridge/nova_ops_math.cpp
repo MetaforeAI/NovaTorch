@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 #include <cmath>
 
@@ -341,6 +342,7 @@ at::Tensor nova_lerp_scalar(
     auto end_c = end.is_contiguous() ? end : end.contiguous();
     auto output = at::empty(self_c.sizes(), self_c.options());
 
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self_c);
     novatorch::invalidateNovaBuffer(end_c);
     const float* a = static_cast<const float*>(
@@ -376,6 +378,7 @@ at::Tensor& nova_lerp_scalar_inplace(
     float w = weight.toFloat();
     auto end_c = end.is_contiguous() ? end : end.contiguous();
 
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self);
     novatorch::invalidateNovaBuffer(end_c);
     float* a = static_cast<float*>(
@@ -396,6 +399,7 @@ at::Tensor& nova_lerp_scalar_inplace(
 // ---------------------------------------------------------------------------
 
 at::Tensor& nova_sqrt_inplace(at::Tensor& self) {
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self);
     float* ptr = static_cast<float*>(
         novatorch::getNovaAllocation(self)->mapped_ptr);
@@ -414,6 +418,7 @@ at::Tensor& nova_div_inplace_scalar(
     at::Tensor& self,
     const at::Scalar& other) {
     float inv = 1.0f / other.toFloat();
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self);
     float* ptr = static_cast<float*>(
         novatorch::getNovaAllocation(self)->mapped_ptr);

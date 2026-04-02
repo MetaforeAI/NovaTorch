@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 #include <cstring>
 #include <cmath>
@@ -72,6 +73,7 @@ at::Tensor nova_embedding(
     auto weight_c = weight.contiguous();
     auto indices_c = indices.contiguous();
 
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(weight_c);
     novatorch::invalidateNovaBuffer(indices_c);
 
@@ -133,6 +135,7 @@ at::Tensor nova_embedding_dense_backward(
     auto grad_c = grad_output.contiguous();
     auto indices_c = indices.contiguous();
 
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(grad_c);
     novatorch::invalidateNovaBuffer(indices_c);
 
@@ -297,6 +300,7 @@ std::tuple<at::Tensor, at::Tensor> nova_native_dropout(
     }
 
     auto input_c = input.contiguous();
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(input_c);
 
     int64_t numel = input_c.numel();
@@ -372,6 +376,7 @@ at::Tensor& nova_bernoulli_float(
 
 at::Tensor nova_nonzero(const at::Tensor& self) {
     auto self_c = self.contiguous();
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self_c);
 
     int64_t numel = self_c.numel();
@@ -465,6 +470,7 @@ at::Tensor nova_scaled_dot_product_attention(
     auto K = key.contiguous();
     auto V = value.contiguous();
 
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(Q);
     novatorch::invalidateNovaBuffer(K);
     novatorch::invalidateNovaBuffer(V);

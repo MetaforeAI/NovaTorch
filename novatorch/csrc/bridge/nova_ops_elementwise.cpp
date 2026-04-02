@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 // ---------------------------------------------------------------------------
 // Push-constant structs — must match the GLSL layout(push_constant) exactly.
@@ -253,6 +254,7 @@ at::Tensor nova_add_scalar(
     if (n == 0) return output;
 
     float val = alpha.toFloat() * other.toFloat();
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self_c);
     const float* src = static_cast<const float*>(
         novatorch::getNovaAllocation(self_c)->mapped_ptr);

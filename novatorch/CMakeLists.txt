@@ -43,6 +43,7 @@ set(NOVATORCH_SOURCES
     csrc/bridge/nova_hooks.cpp
     csrc/bridge/nova_register.cpp
     csrc/bridge/nova_ops_factory.cpp
+    csrc/bridge/nova_batch_context.cpp
     csrc/bridge/nova_ops_dispatch.cpp
     csrc/bridge/nova_ops_copy.cpp
     csrc/bridge/nova_ops_elementwise.cpp

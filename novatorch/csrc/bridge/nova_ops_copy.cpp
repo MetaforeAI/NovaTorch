@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 #include <c10/core/ScalarType.h>
 #include <cstring>
@@ -32,6 +33,8 @@ at::Tensor nova_copy_from(
 
     if (src_nova && dst_nova) {
         if (self.is_contiguous() && self.storage().nbytes() >= tensorBytes(dst)) {
+            // Flush pending batched dispatches before GPU-side copy
+            NovaBatchContext::instance().flush();
             VkBuffer src_buf = novatorch::getNovaBuffer(self);
             VkBuffer dst_buf = novatorch::getNovaBuffer(dst);
             VkDeviceSize copy_size = static_cast<VkDeviceSize>(tensorBytes(dst));
@@ -45,6 +48,7 @@ at::Tensor nova_copy_from(
             });
         } else {
             // Non-contiguous source: element-by-element through mapped memory
+            NovaBatchContext::instance().flush();
             novatorch::invalidateNovaBuffer(self);
             auto* alloc_src = novatorch::getNovaAllocation(self);
             auto* alloc_dst = novatorch::getNovaAllocation(dst);
@@ -85,7 +89,8 @@ at::Tensor nova_copy_from(
     }
 
     if (src_nova && !dst_nova) {
-        // Nova -> CPU: invalidate + memcpy
+        // Nova -> CPU: flush pending GPU work, then invalidate + memcpy
+        NovaBatchContext::instance().flush();
         novatorch::invalidateNovaBuffer(self);
         auto* alloc = novatorch::getNovaAllocation(self);
         if (self.is_contiguous() && self.storage().nbytes() >= tensorBytes(dst)) {
@@ -142,6 +147,7 @@ at::Scalar nova_local_scalar_dense(const at::Tensor& self) {
         "nova_local_scalar_dense: expected 1-element tensor, got ",
         self.numel());
 
+    NovaBatchContext::instance().flush();
     novatorch::invalidateNovaBuffer(self);
     auto* alloc = novatorch::getNovaAllocation(self);
 

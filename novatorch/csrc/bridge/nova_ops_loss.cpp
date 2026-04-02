@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 #include <cmath>
 
 // ---------------------------------------------------------------------------
@@ -218,6 +219,9 @@ std::tuple<at::Tensor, at::Tensor> nova_nll_loss_forward(
         dispatchCompute("nll_loss", 3, sizeof(pc), &pc, bufs, buf_sizes, 1);
     }
 
+    // Flush batched dispatches before reading mapped memory
+    NovaBatchContext::instance().flush();
+
     // Compute total_weight on CPU (count of non-ignored samples)
     {
         novatorch::invalidateNovaBuffer(target);
@@ -262,6 +266,9 @@ at::Tensor& nova_nll_loss_backward_grad_input(
     // Resize and zero grad_input
     grad_input.resize_as_(self);
     grad_input.zero_();
+
+    // Flush pending GPU work before reading mapped memory
+    NovaBatchContext::instance().flush();
 
     // Read inputs from mapped memory
     novatorch::invalidateNovaBuffer(grad_output);
@@ -335,6 +342,9 @@ at::Tensor nova_log_softmax_backward_data(
     compute_softmax_dims(output, dim, outer_size, dim_size, inner_size);
 
     auto grad_input = at::empty_like(grad_output);
+
+    // Flush pending GPU work before reading mapped memory
+    NovaBatchContext::instance().flush();
 
     // Read from mapped memory
     novatorch::invalidateNovaBuffer(grad_output);

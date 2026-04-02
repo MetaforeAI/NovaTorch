@@ -68,8 +68,41 @@ def synchronize():
     _C.synchronize()
 
 
+def reset_descriptor_pool():
+    """Reset the Vulkan descriptor pool, reclaiming all allocated sets.
+
+    Call at the start of each training step (before the forward pass) to
+    reclaim descriptor sets used by the previous step.  Without periodic
+    resets, the pool will exhaust after enough GPU dispatches.
+    """
+    _C.reset_descriptor_pool()
+
+
+def flush():
+    """Submit pending GPU dispatches and wait for completion.
+
+    Called automatically at sync points (.item(), .cpu(), backward ops
+    that read mapped memory). Call explicitly when you need to ensure
+    all GPU work is complete before a timing measurement or checkpoint.
+    """
+    _C.flush()
+
+
+def set_batching(enabled: bool = True):
+    """Enable or disable automatic GPU command batching.
+
+    When enabled (default), multiple GPU dispatches are recorded into
+    a single Vulkan command buffer and submitted together at sync points.
+    This eliminates per-dispatch submit+wait overhead (~20us each).
+
+    Disable for debugging or when single-dispatch semantics are needed.
+    """
+    _C.set_batching(enabled)
+
+
 __version__ = "0.1.0"
 __all__ = [
     "is_available", "device_count", "device_name",
-    "synchronize", "set_log_level",
+    "synchronize", "set_log_level", "reset_descriptor_pool",
+    "flush", "set_batching",
 ]
