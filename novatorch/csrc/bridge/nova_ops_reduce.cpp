@@ -10,22 +10,22 @@ at::Tensor nova_sum(
     const at::Tensor& self,
     std::optional<at::ScalarType> dtype) {
 
-    TORCH_CHECK(self.is_contiguous(), "nova_sum: input must be contiguous");
+    auto self_c = self.is_contiguous() ? self : self.contiguous();
     TORCH_CHECK(
-        self.scalar_type() == at::ScalarType::Float,
+        self_c.scalar_type() == at::ScalarType::Float,
         "nova_sum: only float32 supported");
 
-    const auto numel = static_cast<uint32_t>(self.numel());
+    const auto numel = static_cast<uint32_t>(self_c.numel());
     if (numel == 0) {
-        return at::zeros({}, self.options());
+        return at::zeros({}, self_c.options());
     }
 
     constexpr uint32_t WG_SIZE = 256;
     uint32_t num_groups = (numel + WG_SIZE - 1) / WG_SIZE;
 
-    auto partial = at::empty({static_cast<int64_t>(num_groups)}, self.options());
+    auto partial = at::empty({static_cast<int64_t>(num_groups)}, self_c.options());
 
-    auto* in_alloc = novatorch::getNovaAllocation(self);
+    auto* in_alloc = novatorch::getNovaAllocation(self_c);
     auto* out_alloc = novatorch::getNovaAllocation(partial);
 
     struct { uint32_t numel; } pc{numel};

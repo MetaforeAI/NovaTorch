@@ -620,7 +620,143 @@ at::Tensor nova_scaled_dot_product_attention(
 }
 
 // ===================================================================
-// 8. index.Tensor — advanced integer/boolean indexing
+// 8. _thnn_fused_gru_cell — GRU cell (unfused implementation)
+// ===================================================================
+
+// Schema: _thnn_fused_gru_cell(Tensor input_gates, Tensor hidden_gates,
+//         Tensor hx, Tensor? input_bias, Tensor? hidden_bias)
+//         -> (Tensor, Tensor)
+//
+// input_gates  = x @ W_ih.T    [batch, 3*hidden]
+// hidden_gates = h @ W_hh.T    [batch, 3*hidden]
+// hx           = previous hidden state [batch, hidden]
+// Returns: (new_hidden, workspace) where workspace is used by backward
+
+std::tuple<at::Tensor, at::Tensor> nova_thnn_fused_gru_cell(
+    const at::Tensor& input_gates,
+    const at::Tensor& hidden_gates,
+    const at::Tensor& hx,
+    const std::optional<at::Tensor>& input_bias,
+    const std::optional<at::Tensor>& hidden_bias) {
+
+    // Add biases if present
+    auto ig = input_gates;
+    auto hg = hidden_gates;
+    if (input_bias.has_value() && input_bias->defined())
+        ig = ig + *input_bias;
+    if (hidden_bias.has_value() && hidden_bias->defined())
+        hg = hg + *hidden_bias;
+
+    int64_t hidden_size = hx.size(1);
+
+    // Split gates: each is [batch, hidden_size]
+    // ig = [ig_r, ig_z, ig_n], hg = [hg_r, hg_z, hg_n]
+    auto ig_chunks = ig.chunk(3, 1);
+    auto hg_chunks = hg.chunk(3, 1);
+
+    auto r = at::sigmoid(ig_chunks[0] + hg_chunks[0]);  // reset gate
+    auto z = at::sigmoid(ig_chunks[1] + hg_chunks[1]);  // update gate
+    auto n = at::tanh(ig_chunks[2] + r * hg_chunks[2]); // new gate
+
+    auto hy = (1.0 - z) * n + z * hx;  // new hidden state
+
+    // Workspace tensor for backward pass — store intermediate gates + hx
+    // Layout: [r, z, n, hg_n, hx] concatenated along dim 1
+    auto workspace = at::cat({r, z, n, hg_chunks[2], hx}, 1);
+
+    return std::make_tuple(hy, workspace);
+}
+
+// Backward: _thnn_fused_gru_cell_backward
+// Returns: (grad_input_gates, grad_hidden_gates, grad_hx, grad_input_bias, grad_hidden_bias)
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+nova_thnn_fused_gru_cell_backward(
+    const at::Tensor& grad_hy,
+    const at::Tensor& workspace,
+    bool has_bias) {
+
+    int64_t hidden_size = grad_hy.size(1);
+
+    // Unpack workspace: [r, z, n, hg_n, hx]
+    auto chunks = workspace.chunk(5, 1);
+    auto r = chunks[0];
+    auto z = chunks[1];
+    auto n = chunks[2];
+    auto hg_n = chunks[3];
+    auto hx = chunks[4];
+
+    // hy = (1-z)*n + z*hx
+    // grad_n = grad_hy * (1-z)
+    // grad_z = grad_hy * (hx - n)  -- but we don't have hx, use: grad_hy * (-n) for the (1-z) part
+    // Actually: d(hy)/dz = hx - n, d(hy)/dn = 1-z, d(hy)/dhx = z
+    // We need hx, which we can recover: hx = (hy - (1-z)*n) / z
+    // But z could be 0. Instead, use the standard GRU backward formulas.
+
+    // grad through hy = (1-z)*n + z*hx:
+    auto grad_n = grad_hy * (1.0 - z);
+    auto grad_hx = grad_hy * z;
+
+    // For grad_z: d/dz[(1-z)*n + z*hx] = -n + hx = hx - n
+    // But we don't have hx directly. Recover from: hx = (hy - (1-z)*n) / z
+    // This is numerically unstable when z≈0. Use: hy = (1-z)*n + z*hx → hx-n = (hy-n)/z
+    // Actually, use the chain rule on z directly:
+    // grad_z_pre_sigmoid = grad_hy * (hx - n) * z * (1 - z)
+    // Since we have workspace but not hx, we need a different approach.
+    // The standard trick: store enough in workspace. Let's compute directly.
+
+    // n = tanh(ig_n + r * hg_n)
+    // grad through tanh: grad_tanh = grad_n * (1 - n*n)
+    auto grad_tanh = grad_n * (1.0 - n * n);
+
+    // grad_ig_n = grad_tanh
+    // grad_r_hg_n = grad_tanh → grad_r = grad_tanh * hg_n, grad_hg_n = grad_tanh * r
+    auto grad_ig_n = grad_tanh;
+    auto grad_r_pre = grad_tanh * hg_n;
+    auto grad_hg_n = grad_tanh * r;
+
+    // r = sigmoid(ig_r + hg_r)
+    // grad through sigmoid: grad_sigmoid = grad_r_pre * r * (1 - r)
+    auto grad_r_sigmoid = grad_r_pre * r * (1.0 - r);
+    auto grad_ig_r = grad_r_sigmoid;
+    auto grad_hg_r = grad_r_sigmoid;
+
+    // z = sigmoid(ig_z + hg_z)
+    // We need grad_z, which requires hx - n. Approximate:
+    // The workspace doesn't store hx. The PyTorch CUDA kernel stores it
+    // in workspace. Our workspace stores [r, z, n, hg_n].
+    // For correctness, set grad_z_pre = 0 for now (known limitation).
+    // TODO: store hx in workspace for correct z gradient.
+    // Actually, for many use cases the z gradient is small and training
+    // still converges. But this IS a correctness issue.
+
+    // Better approach: recompute hx from the relationship.
+    // The caller passes grad_hy. We have z, n. If we had the original hx:
+    // grad_z_pre = grad_hy * (hx - n) * z * (1-z)
+    // Without hx we can't compute this exactly.
+    // Workaround: compute via the output hy that autograd tracked.
+    // Actually the autograd graph has hy as output. We have grad_hy.
+    // Let's just not fuse — implement as decomposed ops and let autograd handle it.
+
+    // z = sigmoid(ig_z + hg_z)
+    // d(hy)/dz = hx - n
+    auto grad_z_pre = grad_hy * (hx - n);
+    auto grad_z_sigmoid = grad_z_pre * z * (1.0 - z);
+    auto grad_ig_z = grad_z_sigmoid;
+    auto grad_hg_z = grad_z_sigmoid;
+
+    // Assemble grad_input_gates = [grad_ig_r, grad_ig_z, grad_ig_n]
+    auto grad_input_gates = at::cat({grad_ig_r, grad_ig_z, grad_ig_n}, 1);
+    auto grad_hidden_gates = at::cat({grad_hg_r, grad_hg_z, grad_hg_n}, 1);
+
+    auto grad_input_bias = has_bias ? grad_input_gates.sum(0) : at::Tensor();
+    auto grad_hidden_bias = has_bias ? grad_hidden_gates.sum(0) : at::Tensor();
+
+    return std::make_tuple(grad_input_gates, grad_hidden_gates, grad_hx,
+                           grad_input_bias, grad_hidden_bias);
+}
+
+// ===================================================================
+// 9. index.Tensor — advanced integer/boolean indexing
 // ===================================================================
 
 at::Tensor nova_index_tensor(
