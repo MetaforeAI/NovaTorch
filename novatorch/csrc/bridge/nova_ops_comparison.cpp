@@ -1,4 +1,5 @@
 #include "nova_ops.h"
+#include "nova_batch_context.h"
 
 // ---------------------------------------------------------------------------
 // Push-constant structs -- must match the corresponding .comp shaders
@@ -196,6 +197,79 @@ at::Tensor& nova_where_self_out(
     const at::Tensor& other,
     at::Tensor& out) {
     auto result = nova_where_self(condition, self, other);
+    out.resize_as_(result);
+    out.copy_(result);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// isnan — returns bool tensor
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_isnan(const at::Tensor& self) {
+    auto self_c = self.is_contiguous() ? self : self.contiguous();
+    TORCH_CHECK(self_c.scalar_type() == at::ScalarType::Float,
+        "nova_isnan: only float32 supported");
+
+    const auto numel = static_cast<uint32_t>(self_c.numel());
+    if (numel == 0) {
+        return at::empty_like(self_c, self_c.options().dtype(at::ScalarType::Bool));
+    }
+
+    // Compute as float (shader writes 0.0/1.0), then convert to bool
+    auto float_out = at::empty_like(self_c);
+
+    auto* alloc_in  = novatorch::getNovaAllocation(self_c);
+    auto* alloc_out = novatorch::getNovaAllocation(float_out);
+
+    VkBuffer bufs[2] = {alloc_in->buffer, alloc_out->buffer};
+    VkDeviceSize sizes[2] = {
+        static_cast<VkDeviceSize>(alloc_in->size),
+        static_cast<VkDeviceSize>(alloc_out->size)
+    };
+
+    PCNumel pc{numel};
+
+    dispatchCompute("isnan", 2, sizeof(pc), &pc, bufs, sizes,
+                    divUp(numel, WG_SIZE), 1, 1,
+                    {self_c, float_out});
+
+    // Convert float 0/1 → bool via staging
+    auto bool_out = at::empty(self_c.sizes(),
+        self_c.options().dtype(at::ScalarType::Bool));
+    size_t f_bytes = numel * sizeof(float);
+    size_t b_bytes = numel * sizeof(bool);
+    std::vector<float> fbuf(numel);
+    novatorch::downloadFromDevice(float_out, fbuf.data(), f_bytes);
+    novatorch::withStagingWrite(bool_out, [&](void* dst, size_t) {
+        bool* bptr = static_cast<bool*>(dst);
+        for (uint32_t i = 0; i < numel; ++i)
+            bptr[i] = (fbuf[i] != 0.0f);
+    });
+    return bool_out;
+}
+
+// ---------------------------------------------------------------------------
+// any — reduce bool tensor to single bool
+// ---------------------------------------------------------------------------
+
+at::Tensor nova_any(const at::Tensor& self) {
+    // Download to CPU, run any, upload result
+    NovaBatchContext::instance().flush();
+    auto self_cpu = at::empty(self.sizes(),
+        self.options().device(c10::Device(c10::DeviceType::CPU)));
+    novatorch::downloadFromDevice(self, self_cpu.data_ptr(),
+        self.numel() * self.element_size());
+    auto result_cpu = self_cpu.any();
+    auto result = at::empty(result_cpu.sizes(),
+        result_cpu.options().device(self.device()));
+    novatorch::uploadToDevice(result, result_cpu.data_ptr(),
+        result_cpu.numel() * result_cpu.element_size());
+    return result;
+}
+
+at::Tensor& nova_any_all_out(const at::Tensor& self, at::Tensor& out) {
+    auto result = nova_any(self);
     out.resize_as_(result);
     out.copy_(result);
     return out;
