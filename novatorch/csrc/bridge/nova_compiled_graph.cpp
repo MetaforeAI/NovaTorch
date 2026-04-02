@@ -54,6 +54,36 @@ at::Tensor nova_squeeze_dim(const at::Tensor&, int64_t);
 at::Tensor nova_clone(const at::Tensor&, std::optional<c10::MemoryFormat>);
 at::Tensor nova_detach(const at::Tensor&);
 at::Tensor nova_alias(const at::Tensor&);
+at::Tensor nova_expand(const at::Tensor&, c10::IntArrayRef, bool);
+at::Tensor nova_unsafe_view(const at::Tensor&, c10::SymIntArrayRef);
+
+// Math (additional)
+at::Tensor nova_pow_tensor_scalar(const at::Tensor&, const at::Scalar&);
+at::Tensor nova_clamp(const at::Tensor&, const std::optional<at::Scalar>&, const std::optional<at::Scalar>&);
+at::Tensor nova_mul_scalar(const at::Tensor&, const at::Scalar&);
+at::Tensor nova_add_scalar(const at::Tensor&, const at::Scalar&, const at::Scalar&);
+
+// Copy / factory
+at::Tensor nova_to_copy(const at::Tensor&, std::optional<c10::ScalarType>,
+    std::optional<c10::Layout>, std::optional<c10::Device>,
+    std::optional<bool>, bool, std::optional<c10::MemoryFormat>);
+at::Tensor nova_arange(const at::Scalar&, const at::Scalar&, const at::Scalar&,
+    std::optional<c10::ScalarType>, std::optional<c10::Layout>,
+    std::optional<c10::Device>, std::optional<bool>);
+
+// GRU
+std::tuple<at::Tensor, at::Tensor> nova_thnn_fused_gru_cell(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const std::optional<at::Tensor>&, const std::optional<at::Tensor>&);
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+    nova_thnn_fused_gru_cell_backward(const at::Tensor&, const at::Tensor&, bool);
+
+// Dropout backward
+at::Tensor nova_native_dropout_backward(const at::Tensor&, const at::Tensor&, double);
+
+// Factory
+at::Tensor& nova_fill_scalar(at::Tensor&, const at::Scalar&);
+at::Tensor& nova_zero_(at::Tensor&);
 
 // =========================================================================
 // Op registry: maps op name strings to bound C++ functions
@@ -255,6 +285,123 @@ static std::unordered_map<std::string, OpFactory>& getOpRegistry() {
     };
     registry["aten.alias.default"] = [](const std::vector<double>&) {
         return [](const std::vector<at::Tensor>& t) { return nova_alias(t[0]); };
+    };
+    registry["aten.expand.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            std::vector<int64_t> size;
+            for (double d : s) size.push_back(static_cast<int64_t>(d));
+            return nova_expand(t[0], size, false);
+        };
+    };
+    registry["aten._unsafe_view.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            std::vector<int64_t> shape;
+            for (double d : s) shape.push_back(static_cast<int64_t>(d));
+            // Convert to SymInt
+            std::vector<c10::SymInt> sym_shape(shape.begin(), shape.end());
+            return nova_unsafe_view(t[0], sym_shape);
+        };
+    };
+
+    // --- Math ops missing from registry ---
+    registry["aten.pow.Tensor_Scalar"] = [](const std::vector<double>& s) {
+        double exp = s.empty() ? 2.0 : s[0];
+        return [exp](const std::vector<at::Tensor>& t) {
+            return nova_pow_tensor_scalar(t[0], at::Scalar(exp));
+        };
+    };
+    registry["aten.clamp.default"] = [](const std::vector<double>& s) {
+        // scalar_args: [min_val, max_val] or subset
+        return [s](const std::vector<at::Tensor>& t) {
+            std::optional<at::Scalar> min_v, max_v;
+            if (s.size() > 0) min_v = at::Scalar(s[0]);
+            if (s.size() > 1) max_v = at::Scalar(s[1]);
+            return nova_clamp(t[0], min_v, max_v);
+        };
+    };
+    registry["aten.min.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            // Global min — reduce to scalar via CPU fallback
+            return t[0].min();
+        };
+    };
+    registry["aten.mul.Scalar"] = [](const std::vector<double>& s) {
+        double val = s.empty() ? 1.0 : s[0];
+        return [val](const std::vector<at::Tensor>& t) {
+            return nova_mul_scalar(t[0], at::Scalar(val));
+        };
+    };
+    registry["aten.add.Scalar"] = [](const std::vector<double>& s) {
+        // scalar_args: [other, alpha]
+        double other = s.size() > 0 ? s[0] : 0.0;
+        double alpha = s.size() > 1 ? s[1] : 1.0;
+        return [other, alpha](const std::vector<at::Tensor>& t) {
+            return nova_add_scalar(t[0], at::Scalar(other), at::Scalar(alpha));
+        };
+    };
+
+    // --- Copy / factory ---
+    registry["aten._to_copy.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return nova_to_copy(t[0], std::nullopt, std::nullopt,
+                std::nullopt, std::nullopt, false, std::nullopt);
+        };
+    };
+    registry["aten.arange.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            double end = s.empty() ? 0.0 : s[0];
+            return nova_arange(at::Scalar(0.0), at::Scalar(end), at::Scalar(1.0),
+                at::ScalarType::Long, std::nullopt,
+                c10::Device(c10::DeviceType::PrivateUse1, 0), std::nullopt);
+        };
+    };
+    registry["aten.zeros.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            std::vector<int64_t> shape;
+            for (double d : s) shape.push_back(static_cast<int64_t>(d));
+            auto out = at::empty(shape,
+                at::TensorOptions().device(c10::DeviceType::PrivateUse1));
+            nova_zero_(out);
+            return out;
+        };
+    };
+    registry["aten.new_ones.default"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            std::vector<int64_t> shape;
+            for (double d : s) shape.push_back(static_cast<int64_t>(d));
+            auto out = at::empty(shape, t[0].options());
+            nova_fill_scalar(out, at::Scalar(1.0));
+            return out;
+        };
+    };
+
+    // --- GRU ---
+    registry["aten._thnn_fused_gru_cell.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) -> at::Tensor {
+            auto [hy, workspace] = nova_thnn_fused_gru_cell(
+                t[0], t[1], t[2],
+                t.size() > 3 ? std::optional<at::Tensor>(t[3]) : std::nullopt,
+                t.size() > 4 ? std::optional<at::Tensor>(t[4]) : std::nullopt);
+            // Return as stacked — the plan only handles single tensor outputs
+            // TODO: proper multi-output support
+            return hy;
+        };
+    };
+    registry["aten._thnn_fused_gru_cell_backward.default"] = [](const std::vector<double>& s) {
+        bool has_bias = !s.empty() && s[0] != 0.0;
+        return [has_bias](const std::vector<at::Tensor>& t) -> at::Tensor {
+            auto [gi, gh, gx, gib, ghb] = nova_thnn_fused_gru_cell_backward(
+                t[0], t[1], has_bias);
+            return gi;  // TODO: multi-output
+        };
+    };
+
+    // --- Dropout backward ---
+    registry["aten.native_dropout_backward.default"] = [](const std::vector<double>& s) {
+        double scale = s.empty() ? 1.0 : s[0];
+        return [scale](const std::vector<at::Tensor>& t) {
+            return nova_native_dropout_backward(t[0], t[1], scale);
+        };
     };
 
     return registry;

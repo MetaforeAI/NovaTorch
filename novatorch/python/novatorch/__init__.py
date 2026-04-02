@@ -168,9 +168,9 @@ class profile:
 
         print(f"Device: {device_name()}")
         print(f"GPU Utilization: {self._gpu_util}%")
-        mem_alloc = self._end_mem.get('allocated_bytes', 0) / 1e9
-        mem_used = self._end_mem.get('used_bytes', 0) / 1e9
-        print(f"GPU Memory: {mem_used:.2f} GB allocated, {mem_alloc:.2f} GB reserved")
+        mem_alloc = self._end_mem.get('allocated_bytes', 0)
+        mem_used = self._end_mem.get('used_bytes', 0)
+        print(f"GPU Memory: {mem_used / (1024**3):.2f} GB used, {mem_alloc / (1024**3):.2f} GB allocated")
         print(f"Total GPU time: {total_ms:.2f} ms ({len(self._results)} dispatches)")
         print()
 
