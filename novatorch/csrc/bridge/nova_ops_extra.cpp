@@ -826,3 +826,94 @@ at::Tensor& nova_index_tensor_out(
         result.numel() * result.element_size());
     return out;
 }
+
+// ===================================================================
+// 10. linalg_vector_norm — used by clip_grad_norm_
+// ===================================================================
+
+at::Tensor nova_linalg_vector_norm(
+    const at::Tensor& self,
+    const at::Scalar& ord,
+    at::OptionalIntArrayRef dim,
+    bool keepdim,
+    std::optional<at::ScalarType> dtype) {
+
+    float ord_val = ord.toFloat();
+
+    // Common case: L2 norm (ord=2)
+    if (ord_val == 2.0f) {
+        auto squared = self * self;
+        at::Tensor sum_sq;
+        if (dim.has_value() && !dim->empty()) {
+            sum_sq = squared.sum(*dim, keepdim);
+        } else {
+            sum_sq = squared.sum();
+            if (keepdim) {
+                std::vector<int64_t> shape(self.dim(), 1);
+                sum_sq = sum_sq.reshape(shape);
+            }
+        }
+        return at::sqrt(sum_sq);
+    }
+
+    // L1 norm (ord=1)
+    if (ord_val == 1.0f) {
+        auto abs_self = at::abs(self);
+        if (dim.has_value() && !dim->empty()) {
+            return abs_self.sum(*dim, keepdim);
+        } else {
+            auto result = abs_self.sum();
+            if (keepdim) {
+                std::vector<int64_t> shape(self.dim(), 1);
+                result = result.reshape(shape);
+            }
+            return result;
+        }
+    }
+
+    // Inf norm
+    if (std::isinf(ord_val)) {
+        auto abs_self = at::abs(self);
+        // For inf: max of abs values. For -inf: min of abs values.
+        // CPU fallback for simplicity
+        NovaBatchContext::instance().flush();
+        auto self_cpu = at::empty(self.sizes(),
+            self.options().device(c10::Device(c10::DeviceType::CPU)));
+        novatorch::downloadFromDevice(self, self_cpu.data_ptr(),
+            self.numel() * self.element_size());
+        auto result_cpu = at::linalg_vector_norm(self_cpu, ord, dim, keepdim, dtype);
+        auto result = at::empty(result_cpu.sizes(),
+            result_cpu.options().device(self.device()));
+        novatorch::uploadToDevice(result, result_cpu.contiguous().data_ptr(),
+            result_cpu.numel() * result_cpu.element_size());
+        return result;
+    }
+
+    // General case: (sum(|x|^p))^(1/p)
+    auto abs_self = at::abs(self);
+    auto powered = at::pow(abs_self, ord);
+    at::Tensor sum_p;
+    if (dim.has_value() && !dim->empty()) {
+        sum_p = powered.sum(*dim, keepdim);
+    } else {
+        sum_p = powered.sum();
+        if (keepdim) {
+            std::vector<int64_t> shape(self.dim(), 1);
+            sum_p = sum_p.reshape(shape);
+        }
+    }
+    return at::pow(sum_p, 1.0 / ord_val);
+}
+
+at::Tensor& nova_linalg_vector_norm_out(
+    const at::Tensor& self,
+    const at::Scalar& ord,
+    at::OptionalIntArrayRef dim,
+    bool keepdim,
+    std::optional<at::ScalarType> dtype,
+    at::Tensor& out) {
+    auto result = nova_linalg_vector_norm(self, ord, dim, keepdim, dtype);
+    out.resize_as_(result);
+    out.copy_(result);
+    return out;
+}

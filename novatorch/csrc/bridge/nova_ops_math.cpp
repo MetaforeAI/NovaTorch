@@ -94,6 +94,10 @@ at::Tensor nova_abs(const at::Tensor& self) {
     return dispatch_unary_math(self, "math_abs", "nova_abs");
 }
 
+at::Tensor nova_reciprocal(const at::Tensor& self) {
+    return dispatch_unary_math(self, "math_reciprocal", "nova_reciprocal");
+}
+
 // ---------------------------------------------------------------------------
 // pow.Tensor_Scalar -- out = self ^ exponent
 // ---------------------------------------------------------------------------
@@ -272,6 +276,13 @@ at::Tensor& nova_rsqrt_out(const at::Tensor& self, at::Tensor& out) {
 
 at::Tensor& nova_abs_out(const at::Tensor& self, at::Tensor& out) {
     auto result = nova_abs(self);
+    out.resize_as_(result);
+    out.copy_(result);
+    return out;
+}
+
+at::Tensor& nova_reciprocal_out(const at::Tensor& self, at::Tensor& out) {
+    auto result = nova_reciprocal(self);
     out.resize_as_(result);
     out.copy_(result);
     return out;

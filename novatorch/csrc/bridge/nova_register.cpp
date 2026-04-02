@@ -250,6 +250,8 @@ at::Tensor& nova_max_out(
     const at::Tensor& self, const at::Tensor& other, at::Tensor& out);
 at::Tensor& nova_min_out(
     const at::Tensor& self, const at::Tensor& other, at::Tensor& out);
+at::Tensor nova_reciprocal(const at::Tensor& self);
+at::Tensor& nova_reciprocal_out(const at::Tensor& self, at::Tensor& out);
 at::Tensor& nova_clamp_out(
     const at::Tensor& self,
     const std::optional<at::Scalar>& min_val,
@@ -328,6 +330,16 @@ std::tuple<at::Tensor, at::Tensor> nova_thnn_fused_gru_cell(
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 nova_thnn_fused_gru_cell_backward(
     const at::Tensor& grad_hy, const at::Tensor& workspace, bool has_bias);
+
+// linalg ops (nova_ops_extra.cpp)
+at::Tensor nova_linalg_vector_norm(
+    const at::Tensor& self, const at::Scalar& ord,
+    at::OptionalIntArrayRef dim, bool keepdim,
+    std::optional<at::ScalarType> dtype);
+at::Tensor& nova_linalg_vector_norm_out(
+    const at::Tensor& self, const at::Scalar& ord,
+    at::OptionalIntArrayRef dim, bool keepdim,
+    std::optional<at::ScalarType> dtype, at::Tensor& out);
 
 // Index ops (nova_ops_extra.cpp)
 at::Tensor nova_index_tensor(
@@ -429,7 +441,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("permute", nova_permute);
     m.impl("expand", nova_expand);
     m.impl("view", nova_view);
-    m.impl("reshape", nova_reshape);
+    // reshape: NOT registered here — PyTorch decomposes it into view/_reshape_alias
+    // which we DO register. Registering reshape directly breaks autograd.
     m.impl("slice.Tensor", nova_slice_tensor);
     m.impl("select.int", nova_select_int);
     m.impl("unsqueeze", nova_unsqueeze);
@@ -532,6 +545,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("sqrt.out", nova_sqrt_out);
     m.impl("rsqrt.out", nova_rsqrt_out);
     m.impl("abs.out", nova_abs_out);
+    m.impl("reciprocal", nova_reciprocal);
+    m.impl("reciprocal.out", nova_reciprocal_out);
     m.impl("pow.Tensor_Scalar_out", nova_pow_tensor_scalar_out);
     m.impl("maximum.out", nova_max_out);
     m.impl("minimum.out", nova_min_out);
@@ -593,7 +608,23 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("_thnn_fused_gru_cell", nova_thnn_fused_gru_cell);
     m.impl("_thnn_fused_gru_cell_backward", nova_thnn_fused_gru_cell_backward);
 
+    // linalg ops
+    m.impl("linalg_vector_norm", nova_linalg_vector_norm);
+    m.impl("linalg_vector_norm.out", nova_linalg_vector_norm_out);
+
     // Index ops
     m.impl("index.Tensor", nova_index_tensor);
     m.impl("index.Tensor_out", nova_index_tensor_out);
 }
+
+// ---------------------------------------------------------------------------
+// AutogradPrivateUse1 — register fallthrough for ops that autograd
+// should decompose rather than looking for a custom backward kernel.
+// Without this, PyTorch warns about missing autograd kernels.
+// ---------------------------------------------------------------------------
+
+// Note: No AutogradPrivateUse1 registrations.
+// Registering fallthrough for ops like reshape or sdpa on the Autograd key
+// causes autograd to skip grad_fn creation, breaking backward.
+// The autograd warnings are cosmetic — backward works correctly without
+// explicit Autograd key registration.
