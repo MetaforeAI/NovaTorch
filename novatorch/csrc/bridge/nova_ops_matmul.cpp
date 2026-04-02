@@ -20,6 +20,29 @@ at::Tensor nova_mm(
     const at::Tensor& self,
     const at::Tensor& mat2) {
 
+    // AOTAutograd backward may pass 3D+ tensors (batch dims collapsed).
+    // Flatten to 2D, compute, reshape back.
+    if (self.dim() > 2 || mat2.dim() > 2) {
+        auto a = self.dim() > 2
+            ? self.reshape({-1, self.size(-1)}) : self;
+        auto b = mat2.dim() > 2
+            ? mat2.reshape({mat2.size(-2), -1}) : mat2;
+
+        // Infer original batch shape for output reshape
+        auto result_2d = nova_mm(a, b);
+
+        // Reconstruct batch dims: output is [..., M, N]
+        std::vector<int64_t> out_shape;
+        if (self.dim() > 2) {
+            for (int64_t i = 0; i < self.dim() - 1; ++i)
+                out_shape.push_back(self.size(i));
+        } else {
+            out_shape.push_back(self.size(0));
+        }
+        out_shape.push_back(mat2.size(-1));
+        return result_2d.reshape(out_shape);
+    }
+
     TORCH_CHECK(self.dim() == 2,
         "nova_mm: self must be a 2D matrix, got ", self.dim(), "D");
     TORCH_CHECK(mat2.dim() == 2,
@@ -31,15 +54,15 @@ at::Tensor nova_mm(
     auto self_c = self.is_contiguous() ? self : self.contiguous();
     auto mat2_c = mat2.is_contiguous() ? mat2 : mat2.contiguous();
     TORCH_CHECK(
-        self.scalar_type() == at::ScalarType::Float,
+        self_c.scalar_type() == at::ScalarType::Float,
         "nova_mm: only float32 supported");
     TORCH_CHECK(
-        mat2.scalar_type() == at::ScalarType::Float,
+        mat2_c.scalar_type() == at::ScalarType::Float,
         "nova_mm: only float32 supported");
 
-    const auto M = static_cast<uint32_t>(self.size(0));
-    const auto K = static_cast<uint32_t>(self.size(1));
-    const auto N = static_cast<uint32_t>(mat2.size(1));
+    const auto M = static_cast<uint32_t>(self_c.size(0));
+    const auto K = static_cast<uint32_t>(self_c.size(1));
+    const auto N = static_cast<uint32_t>(mat2_c.size(1));
 
     auto output = at::empty({self_c.size(0), mat2_c.size(1)}, self_c.options());
 
