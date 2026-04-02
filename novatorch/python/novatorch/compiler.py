@@ -212,12 +212,23 @@ class NovaCompiledPlan:
 
     @staticmethod
     def compile(gm: torch.fx.GraphModule, example_inputs: List[torch.Tensor]):
+        """Compile an FX graph into a Nova execution plan.
+
+        example_inputs are FakeTensors from AOTAutograd — they have
+        shape/dtype/device but NO data. We use them ONLY for shape
+        inference, then pre-allocate real Nova tensors for intermediates.
+        """
         plan = NovaCompiledPlan()
         device = torch.device('nova')
 
-        # Shape propagation via eager execution on example inputs
-        shape_env: Dict[str, torch.Tensor] = {}
+        # Shape env: maps node name → FakeTensor (for shape inference)
+        # We only read .shape, .dtype, .numel(), .element_size() from these.
+        shape_env: Dict[str, Any] = {}
         node_to_slot: Dict[str, int] = {}
+
+        # Outputs that pass through an input directly (no compute needed).
+        # At execution time, we copy from the input slot to the output intermediate.
+        passthrough_outputs: Dict[str, int] = {}  # output_name → input_slot
 
         # Map placeholders to input slots
         input_idx = 0
@@ -236,7 +247,6 @@ class NovaCompiledPlan:
                 continue
 
             if node.op == 'output':
-                # node.args[0] is tuple of output nodes
                 args = node.args[0]
                 if isinstance(args, (list, tuple)):
                     plan._output_names = [str(a) for a in args]
@@ -249,52 +259,50 @@ class NovaCompiledPlan:
 
             target = node.target
 
-            # Resolve arguments
-            def get_arg(a):
+            # Resolve FX node args to FakeTensors for shape inference
+            def resolve(a):
                 if isinstance(a, torch.fx.Node):
                     return shape_env[a.name]
                 return a
 
-            args = [get_arg(a) for a in node.args]
-            kwargs = {k: get_arg(v) for k, v in node.kwargs.items()}
+            args = [resolve(a) for a in node.args]
+            kwargs = {k: resolve(v) for k, v in node.kwargs.items()}
 
-            # Execute eagerly for shape inference
+            # FakeTensor shape propagation — this works on FakeTensors
             with torch.no_grad():
                 result = target(*args, **kwargs)
             shape_env[node.name] = result
 
-            # View ops: no dispatch, just track the tensor
+            # View ops: no GPU dispatch, just share the source buffer slot
             if target in _VIEW_OPS:
-                # The result shares storage with an input.
-                # Map this node to the same buffer slot as its source.
                 src_node = node.args[0]
                 if isinstance(src_node, torch.fx.Node) and src_node.name in node_to_slot:
                     node_to_slot[node.name] = node_to_slot[src_node.name]
                 else:
-                    # View created new storage (e.g. expand+contiguous) —
-                    # treat as intermediate
-                    inter = torch.empty(result.shape, dtype=result.dtype, device=device)
+                    # Rare: view op created new storage — allocate intermediate
+                    inter = torch.empty(
+                        result.shape, dtype=result.dtype, device=device)
                     inter_idx = len(intermediates)
                     intermediates.append(inter)
                     node_to_slot[node.name] = intermediate_offset + inter_idx
                 continue
 
-            # Check if op is in our table
+            # Check op table
             if target not in _OP_TABLE:
                 raise RuntimeError(
-                    f"nova_aot compiled: unsupported op {target}. "
-                    f"Fall back to backend='nova' for eager execution.")
+                    f"nova_compiled: unsupported op {target}.")
 
-            # Pre-allocate output intermediate
-            inter = torch.empty(result.shape, dtype=result.dtype, device=device)
+            # Pre-allocate REAL Nova tensor for this op's output
+            inter = torch.empty(
+                result.shape, dtype=result.dtype, device=device)
             inter_idx = len(intermediates)
             intermediates.append(inter)
             node_to_slot[node.name] = intermediate_offset + inter_idx
 
-            # Build kernel spec
+            # Build kernel spec from shapes (no data access)
             spec = _OP_TABLE[target](node, shape_env)
 
-            # Buffer indices: input buffers then output
+            # Buffer indices: tensor node args → buffer table slots, then output
             input_slots = []
             for a in node.args:
                 if isinstance(a, torch.fx.Node):
@@ -302,13 +310,13 @@ class NovaCompiledPlan:
             output_slot = node_to_slot[node.name]
             all_slots = input_slots + [output_slot]
 
-            # Buffer sizes
+            # Buffer sizes from FakeTensor metadata (safe: .numel() works)
             buf_sizes = []
             for a in node.args:
                 if isinstance(a, torch.fx.Node):
                     t = shape_env[a.name]
-                    buf_sizes.append(t.nelement() * t.element_size())
-            buf_sizes.append(result.nelement() * result.element_size())
+                    buf_sizes.append(t.numel() * t.element_size())
+            buf_sizes.append(result.numel() * result.element_size())
 
             _C.add_dispatch_step(
                 plan._plan,
@@ -323,20 +331,20 @@ class NovaCompiledPlan:
                 spec.groups_z,
             )
 
-        # Store intermediates and output mapping.
-        # If an output references an input slot (not an intermediate),
-        # create an intermediate for it so the index is valid.
+        # Handle outputs that reference input slots (pass-through).
+        # Allocate an intermediate for each and record a copy step.
         for name in plan._output_names:
             slot = node_to_slot.get(name)
             if slot is not None and slot < intermediate_offset:
-                # Output references an input — need to allocate an intermediate
+                # This output is a direct reference to an input.
+                # We need an intermediate to return from execute().
                 t = shape_env[name]
-                inter = torch.empty(t.shape, dtype=t.dtype, device=device)
+                inter = torch.empty(
+                    t.shape, dtype=t.dtype, device=device)
                 inter_idx = len(intermediates)
                 intermediates.append(inter)
+                passthrough_outputs[name] = slot  # remember source input slot
                 node_to_slot[name] = intermediate_offset + inter_idx
-                # Note: no dispatch step needed — the input IS the output.
-                # We'll handle this in execute() by copying.
 
         plan._plan.intermediates = intermediates
         output_indices = []
@@ -345,6 +353,7 @@ class NovaCompiledPlan:
             output_indices.append(slot - intermediate_offset)
         plan._plan.output_intermediate_indices = output_indices
         plan._plan.num_outputs = len(output_indices)
+        plan._passthrough = passthrough_outputs
 
         # Init per-plan descriptor pool
         _C.init_compiled_graph_pool(plan._plan)
@@ -354,12 +363,46 @@ class NovaCompiledPlan:
 
     def execute(self, *args):
         inputs = list(args)
-        # Ensure inputs on Nova + contiguous
+
+        # Detect FakeTensor/non-real tensors from AOTAutograd validation.
+        # Use duck-typing: real Nova tensors have an Allocation context
+        # accessible via _C. FakeTensors do not.
+        is_real = True
+        if inputs:
+            try:
+                # Real Nova tensor: get_context() returns an Allocation*
+                novatorch._C.execute_compiled_graph  # just check _C exists
+                t0 = inputs[0]
+                # FakeTensors have class FakeTensor in their MRO
+                for cls in type(t0).__mro__:
+                    if cls.__name__ == 'FakeTensor':
+                        is_real = False
+                        break
+            except Exception:
+                is_real = False
+        if not is_real:
+            # AOTAutograd validates shapes — return FakeTensors with correct shapes
+            outputs = []
+            for idx in self._plan.output_intermediate_indices:
+                inter = self._plan.intermediates[idx]
+                outputs.append(torch.empty(
+                    inter.shape, dtype=inter.dtype, device=inter.device))
+            return outputs
+
+        # Real execution
         for i, a in enumerate(inputs):
-            if a.device.type != 'nova':
-                inputs[i] = a.to(torch.device('nova'))
-            if not inputs[i].is_contiguous():
-                inputs[i] = inputs[i].contiguous()
+            if not a.is_contiguous():
+                inputs[i] = a.contiguous()
+
+        # Copy pass-through inputs into their output intermediates
+        for name, input_slot in self._passthrough.items():
+            for j, oname in enumerate(self._output_names):
+                if oname == name:
+                    inter_idx = self._plan.output_intermediate_indices[j]
+                    out_tensor = self._plan.intermediates[inter_idx]
+                    in_tensor = inputs[input_slot]
+                    out_tensor.copy_(in_tensor)
+                    break
 
         outputs = _C.execute_compiled_graph(self._plan, inputs)
 
