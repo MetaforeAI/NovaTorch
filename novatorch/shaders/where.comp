@@ -2,7 +2,7 @@
 
 layout(local_size_x = 256) in;
 
-layout(set = 0, binding = 0) readonly buffer Cond { float cond_data[]; };
+layout(set = 0, binding = 0) readonly buffer Cond { uint cond_data[]; };
 layout(set = 0, binding = 1) readonly buffer Self { float self_data[]; };
 layout(set = 0, binding = 2) readonly buffer Other { float other_data[]; };
 layout(set = 0, binding = 3) writeonly buffer Out { float out_data[]; };
@@ -15,5 +15,9 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= numel) return;
 
-    out_data[idx] = (cond_data[idx] != 0.0) ? self_data[idx] : other_data[idx];
+    // Condition is bool tensor (1 byte per element), packed into uint32.
+    uint word = cond_data[idx / 4];
+    uint byte_val = (word >> (8 * (idx % 4))) & 0xFF;
+
+    out_data[idx] = (byte_val != 0) ? self_data[idx] : other_data[idx];
 }

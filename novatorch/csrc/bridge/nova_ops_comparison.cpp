@@ -99,26 +99,26 @@ at::Tensor nova_where_self(
     const at::Tensor& self,
     const at::Tensor& other) {
 
-    TORCH_CHECK(condition.sizes() == self.sizes(),
-        "nova_where_self: condition and self must have same sizes");
-    TORCH_CHECK(self.sizes() == other.sizes(),
-        "nova_where_self: self and other must have same sizes");
-    TORCH_CHECK(
-        condition.is_contiguous() && self.is_contiguous() &&
-        other.is_contiguous(),
-        "nova_where_self: all inputs must be contiguous");
     TORCH_CHECK(
         self.scalar_type() == at::ScalarType::Float,
-        "nova_where_self: only float32 supported");
+        "nova_where_self: only float32 supported for self/other");
 
-    const auto numel = static_cast<uint32_t>(self.numel());
-    if (numel == 0) return at::empty_like(self);
+    // Broadcast all three to common shape
+    auto out_sizes = at::infer_size(condition.sizes(), self.sizes());
+    out_sizes = at::infer_size(out_sizes, other.sizes());
 
-    auto output = at::empty_like(self);
+    auto cond_c = condition.expand(out_sizes).contiguous();
+    auto self_c = self.expand(out_sizes).contiguous();
+    auto other_c = other.expand(out_sizes).contiguous();
 
-    auto* alloc_cond  = novatorch::getNovaAllocation(condition);
-    auto* alloc_self  = novatorch::getNovaAllocation(self);
-    auto* alloc_other = novatorch::getNovaAllocation(other);
+    const auto numel = static_cast<uint32_t>(self_c.numel());
+    if (numel == 0) return at::empty_like(self_c);
+
+    auto output = at::empty_like(self_c);
+
+    auto* alloc_cond  = novatorch::getNovaAllocation(cond_c);
+    auto* alloc_self  = novatorch::getNovaAllocation(self_c);
+    auto* alloc_other = novatorch::getNovaAllocation(other_c);
     auto* alloc_out   = novatorch::getNovaAllocation(output);
 
     VkBuffer bufs[4] = {
@@ -134,7 +134,7 @@ at::Tensor nova_where_self(
 
     dispatchCompute("where", 4, sizeof(pc), &pc, bufs, sizes,
                     divUp(numel, WG_SIZE), 1, 1,
-                    {condition, self, other, output});
+                    {cond_c, self_c, other_c, output});
     return output;
 }
 
