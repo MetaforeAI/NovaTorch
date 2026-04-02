@@ -49,11 +49,11 @@ at::Tensor nova_add_tensor(
     auto self_n = ensureNova(self);
     auto other_n = ensureNova(other);
 
-    // Scalar broadcast: use add.Scalar path
-    if (other_n.numel() == 1) {
+    // Scalar broadcast: only for true 0-dim scalars (not [1] or [1,1])
+    if (other_n.dim() == 0) {
         return nova_add_scalar(self_n, other_n.item(), alpha);
     }
-    if (self_n.numel() == 1) {
+    if (self_n.dim() == 0) {
         return nova_add_scalar(other_n, self_n.item(), alpha);
     }
 
@@ -97,17 +97,13 @@ at::Tensor nova_sub_tensor(
     auto self_n = ensureNova(self);
     auto other_n = ensureNova(other);
 
-    // Scalar broadcast
-    if (other_n.numel() == 1) {
+    // Scalar broadcast: only for true 0-dim scalars
+    if (other_n.dim() == 0) {
         float val = alpha.toFloat() * other_n.item<float>();
         return nova_add_scalar(self_n, at::Scalar(-val), at::Scalar(1.0));
     }
-    if (self_n.numel() == 1) {
-        // scalar - alpha*tensor = -alpha*tensor + scalar
+    if (self_n.dim() == 0) {
         float s = self_n.item<float>();
-        // nova_add_scalar(t, other_scalar, alpha) = t + alpha * other_scalar
-        // We want: (-alpha)*tensor + s
-        // = nova_mul_scalar(tensor, -alpha) then nova_add_scalar(result, s, 1)
         auto neg_scaled = nova_mul_scalar(other_n, at::Scalar(-alpha.toFloat()));
         return nova_add_scalar(neg_scaled, at::Scalar(s), at::Scalar(1.0));
     }
@@ -151,10 +147,12 @@ at::Tensor nova_mul_tensor(
     auto self_n = ensureNova(self);
     auto other_n = ensureNova(other);
 
-    if (other_n.numel() == 1) {
+    // Only use scalar shortcut for true 0-dim scalars, not [1] or [1,1] tensors.
+    // Using numel()==1 here breaks broadcasting: [1]*[1,1] should yield [1,1].
+    if (other_n.dim() == 0) {
         return nova_mul_scalar(self_n, other_n.item());
     }
-    if (self_n.numel() == 1) {
+    if (self_n.dim() == 0) {
         return nova_mul_scalar(other_n, self_n.item());
     }
 
@@ -198,12 +196,12 @@ at::Tensor nova_div_tensor(
     auto self_n = ensureNova(self);
     auto other_n = ensureNova(other);
 
-    if (other_n.numel() == 1) {
+    if (other_n.dim() == 0) {
         float val = other_n.item<float>();
         return nova_mul_scalar(self_n, at::Scalar(1.0f / val));
     }
-    if (self_n.numel() == 1) {
-        // scalar / tensor — not easily optimized, fall through to expand
+    if (self_n.dim() == 0) {
+        // scalar / tensor — fall through to expand path
     }
 
     auto self_c = self_n.is_contiguous() ? self_n : self_n.contiguous();

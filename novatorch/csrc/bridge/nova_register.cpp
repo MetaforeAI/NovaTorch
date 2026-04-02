@@ -631,7 +631,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("native_dropout", nova_native_dropout);
     m.impl("bernoulli_.float", nova_bernoulli_float);
     m.impl("nonzero", nova_nonzero);
-    m.impl("scaled_dot_product_attention", nova_scaled_dot_product_attention);
+    // NOTE: SDPA is registered on AutogradPrivateUse1 below, not here.
+    // It uses torch::autograd::Function for proper gradient flow.
 
     // GRU cell
     m.impl("_thnn_fused_gru_cell", nova_thnn_fused_gru_cell);
@@ -652,8 +653,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
 // Without this, PyTorch warns about missing autograd kernels.
 // ---------------------------------------------------------------------------
 
-// Note: No AutogradPrivateUse1 registrations.
-// Registering fallthrough for ops like reshape or sdpa on the Autograd key
-// causes autograd to skip grad_fn creation, breaking backward.
-// The autograd warnings are cosmetic — backward works correctly without
-// explicit Autograd key registration.
+// AutogradPrivateUse1 — ops with custom backward implementations.
+TORCH_LIBRARY_IMPL(aten, AutogradPrivateUse1, m) {
+    // SDPA uses torch::autograd::Function for proper gradient flow.
+    m.impl("scaled_dot_product_attention", nova_scaled_dot_product_attention);
+}
