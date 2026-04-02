@@ -404,6 +404,15 @@ static std::unordered_map<std::string, OpFactory>& getOpRegistry() {
         };
     };
 
+    // --- Embedding ---
+    registry["aten.embedding.default"] = [](const std::vector<double>& s) {
+        // scalar_args: [padding_idx, scale_grad_by_freq, sparse]
+        int64_t padding_idx = s.size() > 0 ? static_cast<int64_t>(s[0]) : -1;
+        return [padding_idx](const std::vector<at::Tensor>& t) {
+            return at::embedding(t[0], t[1], padding_idx, false, false);
+        };
+    };
+
     return registry;
 }
 
@@ -514,11 +523,25 @@ static std::vector<at::Tensor> capturePlan(
     auto* old_pool = batch.swapDescPool(plan.uab_desc_pool.get());
 
     // 7. Execute the C++ op loop — records into dedicated_cmd with UAB descriptors
-    for (auto& step : plan.steps) {
+    for (size_t si = 0; si < plan.steps.size(); ++si) {
+        auto& step = plan.steps[si];
         std::vector<at::Tensor> args;
         args.reserve(step.input_indices.size());
-        for (int idx : step.input_indices)
+        for (int idx : step.input_indices) {
+            if (idx < 0 || idx >= static_cast<int>(plan.fixed_table.size())) {
+                throw std::runtime_error(
+                    "nova compiled: tensor table index " + std::to_string(idx) +
+                    " out of bounds (table size " +
+                    std::to_string(plan.fixed_table.size()) +
+                    ") at step " + std::to_string(si));
+            }
             args.push_back(plan.fixed_table[idx]);
+        }
+        if (step.output_index >= static_cast<int>(plan.fixed_table.size())) {
+            throw std::runtime_error(
+                "nova compiled: output index " + std::to_string(step.output_index) +
+                " out of bounds at step " + std::to_string(si));
+        }
         plan.fixed_table[step.output_index] = step.op_fn(args);
     }
 
