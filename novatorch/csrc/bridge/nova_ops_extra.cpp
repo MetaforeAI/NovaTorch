@@ -865,3 +865,66 @@ at::Tensor& nova_linalg_vector_norm_out(
     out.copy_(result);
     return out;
 }
+
+// ===================================================================
+// 11. _index_put_impl_ — advanced index assignment (in-place)
+// ===================================================================
+
+at::Tensor& nova_index_put_impl(
+    at::Tensor& self,
+    const c10::List<std::optional<at::Tensor>>& indices,
+    const at::Tensor& values,
+    bool accumulate,
+    bool unsafe) {
+
+    // CPU fallback: download self + indices + values, run on CPU, upload back.
+    NovaBatchContext::instance().flush();
+
+    size_t self_bytes = self.numel() * self.element_size();
+
+    // Download self to CPU
+    auto self_cpu = at::empty(self.sizes(),
+        self.options().device(c10::Device(c10::DeviceType::CPU)));
+    novatorch::downloadFromDevice(self, self_cpu.data_ptr(), self_bytes);
+
+    // Download values
+    at::Tensor values_cpu;
+    if (values.device().type() == c10::DeviceType::PrivateUse1) {
+        values_cpu = at::empty(values.sizes(),
+            values.options().device(c10::Device(c10::DeviceType::CPU)));
+        novatorch::downloadFromDevice(values, values_cpu.data_ptr(),
+            values.numel() * values.element_size());
+    } else {
+        values_cpu = values;
+    }
+
+    // Download indices
+    c10::List<std::optional<at::Tensor>> cpu_indices;
+    cpu_indices.reserve(indices.size());
+    for (int64_t i = 0; i < static_cast<int64_t>(indices.size()); ++i) {
+        std::optional<at::Tensor> idx_opt =
+            static_cast<std::optional<at::Tensor>>(indices.get(i));
+        if (idx_opt.has_value() && idx_opt->defined()) {
+            auto idx = *idx_opt;
+            if (idx.device().type() == c10::DeviceType::PrivateUse1) {
+                auto idx_cpu = at::empty(idx.sizes(),
+                    idx.options().device(c10::Device(c10::DeviceType::CPU)));
+                novatorch::downloadFromDevice(idx, idx_cpu.data_ptr(),
+                    idx.numel() * idx.element_size());
+                cpu_indices.push_back(idx_cpu);
+            } else {
+                cpu_indices.push_back(idx);
+            }
+        } else {
+            cpu_indices.push_back(std::optional<at::Tensor>());
+        }
+    }
+
+    // Run on CPU
+    at::_index_put_impl_(self_cpu, cpu_indices, values_cpu, accumulate, unsafe);
+
+    // Upload result back to device
+    novatorch::uploadToDevice(self, self_cpu.data_ptr(), self_bytes);
+
+    return self;
+}
