@@ -274,6 +274,11 @@ at::Tensor& nova_tanh_out(const at::Tensor& self, at::Tensor& out);
 at::Tensor& nova_threshold_backward_out(
     const at::Tensor& grad_output, const at::Tensor& self,
     const at::Scalar& threshold, at::Tensor& out);
+at::Tensor nova_sigmoid_backward(
+    const at::Tensor& grad_output, const at::Tensor& output);
+at::Tensor& nova_sigmoid_backward_grad_input(
+    const at::Tensor& grad_output, const at::Tensor& output,
+    at::Tensor& grad_input);
 
 // Comparison .out (nova_ops_comparison.cpp)
 at::Tensor& nova_eq_scalar_out(
@@ -566,6 +571,8 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("sigmoid.out", nova_sigmoid_out);
     m.impl("tanh.out", nova_tanh_out);
     m.impl("threshold_backward.grad_input", nova_threshold_backward_out);
+    m.impl("sigmoid_backward", nova_sigmoid_backward);
+    m.impl("sigmoid_backward.grad_input", nova_sigmoid_backward_grad_input);
 
     // Comparison .out
     m.impl("eq.Scalar_out", nova_eq_scalar_out);
