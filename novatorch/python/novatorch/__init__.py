@@ -44,6 +44,7 @@ torch.utils.rename_privateuse1_backend("nova")
 _nova_mod = types.ModuleType("torch.nova")
 _nova_mod.__package__ = "torch"
 _nova_mod.is_available = lambda: _C.device_count() > 0
+_nova_mod.is_initialized = lambda: True
 _nova_mod.device_count = lambda: _C.device_count()
 _nova_mod.current_device = lambda: 0
 _nova_mod.synchronize = lambda: _C.synchronize()

@@ -5,6 +5,7 @@
 #include "nova_allocator.h"
 #include "nova_ops.h"
 #include "nova_batch_context.h"
+#include "nova_compiled_graph.h"
 
 // Forward declaration for custom fused ops
 at::Tensor nova_ssm_scan(
@@ -67,4 +68,56 @@ PYBIND11_MODULE(_C, m) {
         py::arg("C"), py::arg("D_val"),
         "Fused SSM scan: x[t] = A_bar * x[t-1] + B_bar[:,t,:] * u[:,t,:], "
         "y[t] = dot(C, x[t]) + D * sum(u[:,t,:]). Returns [batch, seq_len, 1].");
+
+    // ---------------------------------------------------------------
+    // Compiled graph execution (torch.compile nova_aot backend)
+    // ---------------------------------------------------------------
+
+    py::class_<NovaCompiledGraph, std::shared_ptr<NovaCompiledGraph>>(m, "NovaCompiledGraph")
+        .def(py::init<>())
+        .def_readwrite("num_inputs", &NovaCompiledGraph::num_inputs)
+        .def_readwrite("num_outputs", &NovaCompiledGraph::num_outputs)
+        .def_readwrite("intermediates", &NovaCompiledGraph::intermediates)
+        .def_readwrite("output_intermediate_indices",
+                       &NovaCompiledGraph::output_intermediate_indices);
+
+    m.def("add_dispatch_step", [](
+        NovaCompiledGraph& plan,
+        const std::string& kernel_name,
+        uint32_t num_buffers,
+        uint32_t push_constant_size,
+        py::bytes push_data_bytes,
+        std::vector<uint32_t> buffer_indices,
+        std::vector<uint64_t> buffer_sizes,
+        uint32_t groups_x, uint32_t groups_y, uint32_t groups_z
+    ) {
+        NovaDispatchStep step;
+        step.pipeline = &getPipelineCache().get(
+            kernel_name, num_buffers, push_constant_size);
+        std::string pd = push_data_bytes;
+        step.push_data.assign(pd.begin(), pd.end());
+        step.push_constant_size = push_constant_size;
+        step.num_buffers = num_buffers;
+        step.groups_x = groups_x;
+        step.groups_y = groups_y;
+        step.groups_z = groups_z;
+        step.buffer_indices = std::move(buffer_indices);
+        step.buffer_sizes.reserve(buffer_sizes.size());
+        for (auto s : buffer_sizes)
+            step.buffer_sizes.push_back(static_cast<VkDeviceSize>(s));
+        plan.steps.push_back(std::move(step));
+    }, "Add a dispatch step to a compiled graph plan");
+
+    m.def("init_compiled_graph_pool", [](NovaCompiledGraph& plan) {
+        plan.desc_pool = std::make_unique<NovaDescriptorPool>();
+        plan.desc_pool->init(NovaContext::instance().device(),
+                             std::max(1u, static_cast<uint32_t>(plan.steps.size())));
+    }, "Initialize the descriptor pool for a compiled graph");
+
+    m.def("execute_compiled_graph", [](
+        NovaCompiledGraph& plan,
+        std::vector<at::Tensor> inputs
+    ) -> std::vector<at::Tensor> {
+        return executeCompiledGraph(plan, inputs);
+    }, "Execute a compiled graph with given inputs");
 }

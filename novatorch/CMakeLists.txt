@@ -58,6 +58,7 @@ set(NOVATORCH_SOURCES
     csrc/bridge/nova_pipeline_cache.cpp
     csrc/bridge/nova_descriptor_pool.cpp
     csrc/bridge/nova_staging_pool.cpp
+    csrc/bridge/nova_compiled_graph.cpp
     csrc/bindings/module.cpp
 )
 
