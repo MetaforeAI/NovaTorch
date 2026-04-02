@@ -449,14 +449,19 @@ at::Tensor nova_scaled_dot_product_attention(
     std::optional<double> scale,
     bool enable_gqa) {
 
-    // Q: [B, H, L, D], K: [B, H, S, D], V: [B, H, S, D]
-    TORCH_CHECK(query.dim() == 4, "nova_sdpa: query must be 4-D");
-    TORCH_CHECK(key.dim() == 4, "nova_sdpa: key must be 4-D");
-    TORCH_CHECK(value.dim() == 4, "nova_sdpa: value must be 4-D");
+    // Support both 3D (N, S, D) and 4D (B, H, S, D) inputs.
+    // 3D is treated as (N, 1, S, D) — single head per batch element.
+    TORCH_CHECK(query.dim() == 3 || query.dim() == 4,
+        "nova_sdpa: query must be 3-D or 4-D, got ", query.dim(), "-D");
+    TORCH_CHECK(key.dim() == query.dim(),
+        "nova_sdpa: key must have same ndim as query");
+    TORCH_CHECK(value.dim() == query.dim(),
+        "nova_sdpa: value must have same ndim as query");
 
-    auto Q = query.contiguous();
-    auto K = key.contiguous();
-    auto V = value.contiguous();
+    bool was_3d = (query.dim() == 3);
+    auto Q = was_3d ? query.unsqueeze(1).contiguous() : query.contiguous();
+    auto K = was_3d ? key.unsqueeze(1).contiguous() : key.contiguous();
+    auto V = was_3d ? value.unsqueeze(1).contiguous() : value.contiguous();
 
     int64_t B = Q.size(0);
     int64_t H = Q.size(1);
@@ -615,6 +620,9 @@ at::Tensor nova_scaled_dot_product_attention(
             }
         }
     });
+
+    // Squeeze back to 3D if input was 3D
+    if (was_3d) output = output.squeeze(1);
 
     return output;
 }
