@@ -111,7 +111,8 @@ def set_batching(enabled: bool = True):
     _C.set_batching(enabled)
 
 
-def ssm_scan(A_bar, B_bar, u, C, D_val: float):
+@torch.compiler.allow_in_graph
+def ssm_scan(A_bar, B_bar, u, C, D_val):
     """Fused SSM scan — replaces sequential Python loop with single GPU dispatch.
 
     For each timestep t:
@@ -123,12 +124,15 @@ def ssm_scan(A_bar, B_bar, u, C, D_val: float):
         B_bar: [batch, seq_len, state_dim] — input weight per step
         u:     [batch, seq_len, state_dim] — input sequence
         C:     [state_dim] — output projection
-        D_val: scalar skip connection weight
+        D_val: scalar or 0-dim tensor skip connection weight
 
     Returns:
         y: [batch, seq_len, 1] — output at every timestep
     """
-    return _C.ssm_scan(A_bar, B_bar, u, C, D_val)
+    # Handle D_val as tensor (avoid .item() graph break)
+    if isinstance(D_val, torch.Tensor):
+        D_val = D_val.detach().cpu().item()
+    return _C.ssm_scan(A_bar, B_bar, u, C, float(D_val))
 
 
 class profile:

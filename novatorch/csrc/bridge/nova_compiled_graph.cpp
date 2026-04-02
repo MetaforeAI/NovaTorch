@@ -442,6 +442,13 @@ static std::unordered_map<std::string, OpFactory>& getOpRegistry() {
         };
     };
 
+    // --- max (global reduction) ---
+    registry["aten.max.default"] = [](const std::vector<double>&) {
+        return [](const std::vector<at::Tensor>& t) {
+            return t[0].max();
+        };
+    };
+
     return registry;
 }
 
