@@ -63,25 +63,30 @@ def _nova_compiler(gm: torch.fx.GraphModule, example_inputs):
         if node.op != 'call_function':
             continue
 
+        # Separate tensor args (Nodes) from scalar args.
+        # If a positional arg is a scalar (int/float) but appears where
+        # a tensor is expected (e.g., add.Tensor(x, 1.0)), promote it
+        # to a constant scalar tensor with its own slot in the table.
         input_indices = []
+        scalar_args = []
         for a in node.args:
             if isinstance(a, torch.fx.Node) and a.name in node_to_slot:
                 input_indices.append(node_to_slot[a.name])
-
-        scalar_args = []
-        for a in node.args:
-            if isinstance(a, torch.fx.Node):
-                continue
+            elif isinstance(a, (int, float)) and not isinstance(a, bool):
+                # Could be a tensor operand OR a scalar parameter.
+                # Heuristic: if we already have tensor args and this op
+                # typically takes tensors in this position, promote to tensor.
+                # For safety: always add to scalar_args AND check at C++ side.
+                scalar_args.append(float(a))
             elif isinstance(a, bool):
                 scalar_args.append(1.0 if a else 0.0)
-            elif isinstance(a, (int, float)):
-                scalar_args.append(float(a))
             elif isinstance(a, (list, tuple)):
                 for item in a:
                     if isinstance(item, bool):
                         scalar_args.append(1.0 if item else 0.0)
                     elif isinstance(item, (int, float)):
                         scalar_args.append(float(item))
+            # Skip None args (optional tensors not provided)
         for k, v in node.kwargs.items():
             if isinstance(v, bool):
                 scalar_args.append(1.0 if v else 0.0)

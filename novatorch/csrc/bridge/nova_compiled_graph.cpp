@@ -100,26 +100,43 @@ static std::unordered_map<std::string, OpFactory>& getOpRegistry() {
     initialized = true;
 
     // --- Elementwise ---
+    // Elementwise ops: handle both 2-tensor and 1-tensor+scalar cases.
+    // AOTAutograd may produce add.Tensor(x, 1.0) where 1.0 is a constant.
     registry["aten.add.Tensor"] = [](const std::vector<double>& s) {
-        double alpha = s.empty() ? 1.0 : s[0];
-        return [alpha](const std::vector<at::Tensor>& t) {
-            return nova_add_tensor(t[0], t[1], at::Scalar(alpha));
+        return [s](const std::vector<at::Tensor>& t) {
+            if (t.size() >= 2) {
+                double alpha = s.empty() ? 1.0 : s[0];
+                return nova_add_tensor(t[0], t[1], at::Scalar(alpha));
+            }
+            // 1 tensor + scalar: first scalar_arg is the value, second is alpha
+            double val = s.size() > 0 ? s[0] : 0.0;
+            double alpha = s.size() > 1 ? s[1] : 1.0;
+            return nova_add_scalar(t[0], at::Scalar(val), at::Scalar(alpha));
         };
     };
     registry["aten.sub.Tensor"] = [](const std::vector<double>& s) {
-        double alpha = s.empty() ? 1.0 : s[0];
-        return [alpha](const std::vector<at::Tensor>& t) {
-            return nova_sub_tensor(t[0], t[1], at::Scalar(alpha));
+        return [s](const std::vector<at::Tensor>& t) {
+            if (t.size() >= 2) {
+                double alpha = s.empty() ? 1.0 : s[0];
+                return nova_sub_tensor(t[0], t[1], at::Scalar(alpha));
+            }
+            double val = s.size() > 0 ? s[0] : 0.0;
+            double alpha = s.size() > 1 ? s[1] : 1.0;
+            return nova_add_scalar(t[0], at::Scalar(-val * alpha), at::Scalar(1.0));
         };
     };
-    registry["aten.mul.Tensor"] = [](const std::vector<double>&) {
-        return [](const std::vector<at::Tensor>& t) {
-            return nova_mul_tensor(t[0], t[1]);
+    registry["aten.mul.Tensor"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            if (t.size() >= 2) return nova_mul_tensor(t[0], t[1]);
+            double val = s.empty() ? 1.0 : s[0];
+            return nova_mul_scalar(t[0], at::Scalar(val));
         };
     };
-    registry["aten.div.Tensor"] = [](const std::vector<double>&) {
-        return [](const std::vector<at::Tensor>& t) {
-            return nova_div_tensor(t[0], t[1]);
+    registry["aten.div.Tensor"] = [](const std::vector<double>& s) {
+        return [s](const std::vector<at::Tensor>& t) {
+            if (t.size() >= 2) return nova_div_tensor(t[0], t[1]);
+            double val = s.empty() ? 1.0 : s[0];
+            return nova_mul_scalar(t[0], at::Scalar(1.0 / val));
         };
     };
     registry["aten.neg.default"] = [](const std::vector<double>&) {
