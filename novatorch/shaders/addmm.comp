@@ -1,0 +1,32 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 1) readonly buffer A { float a_data[]; };
+layout(set = 0, binding = 2) readonly buffer B { float b_data[]; };
+layout(set = 0, binding = 3) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    float beta;
+    float alpha;
+    uint bias_is_1d; // 1 if bias is [N], 0 if bias is [M,N]
+};
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= M || col >= N) return;
+
+    float sum = 0.0;
+    for (uint k = 0; k < K; k++) {
+        sum += a_data[row * K + k] * b_data[k * N + col];
+    }
+
+    // bias index: if 1D bias, use col; if 2D, use row*N+col
+    uint bias_idx = (bias_is_1d != 0) ? col : (row * N + col);
+    out_data[row * N + col] = beta * bias[bias_idx] + alpha * sum;
+}

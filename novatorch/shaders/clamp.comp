@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint numel;
+    float min_val;
+    float max_val;
+    int has_min;
+    int has_max;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numel) return;
+
+    float val = a[idx];
+    if (has_min != 0) val = max(val, min_val);
+    if (has_max != 0) val = min(val, max_val);
+    out_data[idx] = val;
+}

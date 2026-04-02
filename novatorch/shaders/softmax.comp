@@ -1,0 +1,70 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) writeonly buffer Out { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    uint outer_size;
+    uint dim_size;
+    uint inner_size;
+};
+
+shared float sdata[256];
+
+void main() {
+    // Each workgroup processes one "row" along the softmax dimension.
+    // row_idx = workgroup index
+    uint row_idx = gl_WorkGroupID.x;
+    if (row_idx >= outer_size * inner_size) return;
+
+    uint outer_idx = row_idx / inner_size;
+    uint inner_idx = row_idx % inner_size;
+    uint base = outer_idx * dim_size * inner_size + inner_idx;
+    uint lid = gl_LocalInvocationID.x;
+
+    // Step 1: find max
+    float local_max = -1.0 / 0.0; // -inf
+    for (uint d = lid; d < dim_size; d += 256) {
+        float val = a[base + d * inner_size];
+        local_max = max(local_max, val);
+    }
+    sdata[lid] = local_max;
+    barrier();
+
+    // Parallel reduction for max
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            sdata[lid] = max(sdata[lid], sdata[lid + s]);
+        }
+        barrier();
+    }
+    float row_max = sdata[0];
+    barrier();
+
+    // Step 2: compute exp(x - max) and sum
+    float local_sum = 0.0;
+    for (uint d = lid; d < dim_size; d += 256) {
+        float val = exp(a[base + d * inner_size] - row_max);
+        local_sum += val;
+    }
+    sdata[lid] = local_sum;
+    barrier();
+
+    // Parallel reduction for sum
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            sdata[lid] += sdata[lid + s];
+        }
+        barrier();
+    }
+    float row_sum = sdata[0];
+    barrier();
+
+    // Step 3: normalize
+    for (uint d = lid; d < dim_size; d += 256) {
+        uint offset = base + d * inner_size;
+        out_data[offset] = exp(a[offset] - row_max) / row_sum;
+    }
+}

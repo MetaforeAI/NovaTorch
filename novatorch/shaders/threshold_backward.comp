@@ -1,0 +1,19 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer GradOutput { float grad_output[]; };
+layout(set = 0, binding = 1) readonly buffer SelfData { float self_data[]; };
+layout(set = 0, binding = 2) writeonly buffer GradInput { float grad_input[]; };
+
+layout(push_constant) uniform PC {
+    uint numel;
+    float threshold;
+};
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= numel) return;
+
+    grad_input[idx] = (self_data[idx] > threshold) ? grad_output[idx] : 0.0;
+}

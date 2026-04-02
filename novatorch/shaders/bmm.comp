@@ -1,0 +1,32 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint batch;
+    uint M;
+    uint N;
+    uint K;
+};
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;  // N dim
+    uint row = gl_GlobalInvocationID.y;  // M dim
+    uint bat = gl_GlobalInvocationID.z;  // batch dim
+
+    if (row >= M || col >= N || bat >= batch) return;
+
+    uint a_offset = bat * M * K;
+    uint b_offset = bat * K * N;
+    uint c_offset = bat * M * N;
+
+    float sum = 0.0;
+    for (uint k = 0; k < K; k++) {
+        sum += a[a_offset + row * K + k] * b[b_offset + k * N + col];
+    }
+    c[c_offset + row * N + col] = sum;
+}

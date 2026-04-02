@@ -1,0 +1,64 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Input { float input_data[]; };
+layout(set = 0, binding = 1) readonly buffer Target { int target_data[]; };
+layout(set = 0, binding = 2) buffer Output { float output_data[]; };
+
+layout(push_constant) uniform PC {
+    uint batch_size;
+    uint num_classes;
+    int reduction;     // 0=none, 1=mean, 2=sum
+    int ignore_index;
+};
+
+shared float sdata[256];
+shared float scount[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+
+    if (reduction == 0) {
+        // No reduction: each thread processes one batch element
+        uint idx = gl_GlobalInvocationID.x;
+        if (idx >= batch_size) return;
+
+        int t = target_data[idx];
+        if (t == ignore_index) {
+            output_data[idx] = 0.0;
+            return;
+        }
+        output_data[idx] = -input_data[idx * num_classes + uint(t)];
+        return;
+    }
+
+    // reduction == 1 (mean) or 2 (sum): use shared memory reduction
+    float local_loss = 0.0;
+    float local_count = 0.0;
+    for (uint i = lid; i < batch_size; i += 256) {
+        int t = target_data[i];
+        if (t == ignore_index) continue;
+        local_loss += -input_data[i * num_classes + uint(t)];
+        local_count += 1.0;
+    }
+    sdata[lid] = local_loss;
+    scount[lid] = local_count;
+    barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            sdata[lid] += sdata[lid + s];
+            scount[lid] += scount[lid + s];
+        }
+        barrier();
+    }
+
+    if (lid == 0) {
+        if (reduction == 1 && scount[0] > 0.0) {
+            output_data[0] = sdata[0] / scount[0];
+        } else {
+            output_data[0] = sdata[0];
+        }
+    }
+}
