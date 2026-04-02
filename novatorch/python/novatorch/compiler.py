@@ -100,6 +100,10 @@ def _nova_compiler(gm: torch.fx.GraphModule, example_inputs):
             _C.add_op_step(plan, str(node.target), input_indices,
                            output_slot, scalar_args)
         except RuntimeError:
+            import sys
+            print(f"[nova] FALLBACK: op '{node.target}' not in C++ registry, "
+                  f"graph has {sum(1 for n in gm.graph.nodes if n.op=='call_function')} ops",
+                  file=sys.stderr)
             all_in_registry = False
             break
 
