@@ -1,4 +1,5 @@
 #include "nova_batch_context.h"
+#include "nova_compiled_graph.h"
 #include "nova_pipeline_cache.h"
 
 NovaBatchContext::NovaBatchContext() = default;
@@ -124,14 +125,21 @@ void NovaBatchContext::recordDispatch(
         return;
     }
 
-    if (!recording_) beginBatch();
+    // In capture mode: record into external command buffer
+    // In normal mode: record into batch context's command buffer
+    if (!capturing_ && !recording_) beginBatch();
 
     // Pipeline lookup (thread-safe: pipelines are immutable after creation)
     auto& pi = getPipelineCache().get(
         kernel_name, num_buffers, push_constant_size);
 
-    // Allocate from PER-THREAD descriptor pool (no mutex needed)
-    VkDescriptorSet desc = desc_pool_->allocate(pi.desc_layout);
+    // Allocate from active descriptor pool.
+    // During capture: use the plan's dedicated UAB pool.
+    // Normal mode: use per-thread pool.
+    // Both use the same UAB layout (desc_layout == desc_layout_uab now).
+    NovaDescriptorPool* pool = (capturing_ && active_desc_pool_)
+        ? active_desc_pool_ : desc_pool_.get();
+    VkDescriptorSet desc = pool->allocate(pi.desc_layout);
 
     // Update descriptors (host-side operation, no mutex needed)
     std::vector<VkDescriptorBufferInfo> buf_infos(num_buffers);
@@ -150,7 +158,7 @@ void NovaBatchContext::recordDispatch(
         NovaContext::instance().device(),
         num_buffers, writes.data(), 0, nullptr);
 
-    VkCommandBuffer cmd = resources_->cmd;
+    VkCommandBuffer cmd = capturing_ ? capture_cmd_ : resources_->cmd;
 
     // --- Dependency-aware barriers ---
     // Convention: last buffer is the output (write), others are inputs (reads).
@@ -213,6 +221,21 @@ void NovaBatchContext::recordDispatch(
     // Mark output buffer as having a pending write
     pending_writes_.insert(write_buf);
 
+    // Track descriptor→buffer mapping during capture for replay rebinding
+    if (capturing_) {
+        DescriptorMapping mapping;
+        mapping.set = desc;
+        mapping.pipeline = &pi;
+        mapping.num_buffers = num_buffers;
+        mapping.bound_buffers.resize(num_buffers);
+        mapping.bound_sizes.resize(num_buffers);
+        for (uint32_t i = 0; i < num_buffers; ++i) {
+            mapping.bound_buffers[i] = buffers[i];
+            mapping.bound_sizes[i] = buffer_sizes[i];
+        }
+        capture_mappings_.push_back(std::move(mapping));
+    }
+
     // Retain tensors to prevent use-after-free during batch lifetime
     for (const auto& t : retain) {
         retained_.push_back(t);
@@ -236,4 +259,56 @@ void NovaBatchContext::setEnabled(bool enabled) {
 
 bool NovaBatchContext::isEnabled() const {
     return enabled_;
+}
+
+// -------------------------------------------------------------------------
+// Capture mode: record into an external command buffer
+// -------------------------------------------------------------------------
+
+void NovaBatchContext::beginCapture(VkCommandBuffer external_cmd) {
+    // Flush any pending normal batch first
+    if (recording_) flush();
+
+    // Ensure we have a descriptor pool
+    if (!desc_pool_) {
+        desc_pool_ = std::make_unique<NovaDescriptorPool>();
+        desc_pool_->init(NovaContext::instance().device());
+    }
+
+    capture_cmd_ = external_cmd;
+    capturing_ = true;
+    dispatch_count_ = 0;
+    pending_writes_.clear();
+}
+
+std::unique_ptr<NovaDescriptorPool> NovaBatchContext::endCapture() {
+    capturing_ = false;
+    capture_cmd_ = VK_NULL_HANDLE;
+    dispatch_count_ = 0;
+    pending_writes_.clear();
+
+    return std::move(desc_pool_);
+}
+
+std::vector<DescriptorMapping> NovaBatchContext::endCaptureWithMap(
+    std::vector<at::Tensor>* out_retained) {
+    capturing_ = false;
+    capture_cmd_ = VK_NULL_HANDLE;
+    dispatch_count_ = 0;
+    pending_writes_.clear();
+
+    // Transfer retained tensors to caller — keeps VkBuffers alive
+    // for the lifetime of the compiled plan's command buffer.
+    if (out_retained) {
+        *out_retained = std::move(retained_);
+    }
+    retained_.clear();
+
+    return std::move(capture_mappings_);
+}
+
+NovaDescriptorPool* NovaBatchContext::swapDescPool(NovaDescriptorPool* new_pool) {
+    NovaDescriptorPool* old = active_desc_pool_;
+    active_desc_pool_ = new_pool;
+    return old;
 }

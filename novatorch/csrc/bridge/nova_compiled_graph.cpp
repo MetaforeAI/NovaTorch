@@ -289,44 +289,190 @@ void addPlanStep(
 }
 
 // =========================================================================
-// Plan execution
+// Plan destructor — cleanup Vulkan resources
+// =========================================================================
+
+CompiledPlan::~CompiledPlan() {
+    if (dedicated_cmd != VK_NULL_HANDLE || dedicated_pool != VK_NULL_HANDLE ||
+        dedicated_fence != VK_NULL_HANDLE) {
+        VkDevice dev = NovaContext::instance().device();
+        if (dedicated_fence != VK_NULL_HANDLE) {
+            vkWaitForFences(dev, 1, &dedicated_fence, VK_TRUE, UINT64_MAX);
+            vkDestroyFence(dev, dedicated_fence, nullptr);
+        }
+        if (dedicated_cmd != VK_NULL_HANDLE && dedicated_pool != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(dev, dedicated_pool, 1, &dedicated_cmd);
+        }
+        if (dedicated_pool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(dev, dedicated_pool, nullptr);
+        }
+    }
+}
+
+// =========================================================================
+// Capture: first call — execute ops with UAB descriptors, save everything
+// =========================================================================
+
+static std::vector<at::Tensor> capturePlan(
+    CompiledPlan& plan,
+    const std::vector<at::Tensor>& inputs)
+{
+    auto& compute = NovaContext::instance().compute();
+    VkDevice dev = NovaContext::instance().device();
+
+    // 1. Flush any pending eager dispatches
+    NovaBatchContext::instance().flush();
+
+    // 2. Create dedicated Vulkan resources for this plan
+    VkCommandPoolCreateInfo pool_ci{};
+    pool_ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_ci.queueFamilyIndex = compute.getComputeQueueFamily();
+    vkCreateCommandPool(dev, &pool_ci, nullptr, &plan.dedicated_pool);
+
+    VkCommandBufferAllocateInfo cmd_ci{};
+    cmd_ci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_ci.commandPool = plan.dedicated_pool;
+    cmd_ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_ci.commandBufferCount = 1;
+    vkAllocateCommandBuffers(dev, &cmd_ci, &plan.dedicated_cmd);
+
+    VkFenceCreateInfo fence_ci{};
+    fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(dev, &fence_ci, nullptr, &plan.dedicated_fence);
+
+    // 3. Create UAB descriptor pool (persistent sets, not reset between replays)
+    plan.uab_desc_pool = std::make_unique<NovaDescriptorPool>();
+    plan.uab_desc_pool->initUAB(dev,
+        std::max(1, static_cast<int>(plan.steps.size()) * 2));
+
+    // 4. Set up tensor table with actual input tensors
+    plan.fixed_table.resize(plan.tensor_table_size);
+    plan.captured_input_buffers.resize(plan.num_inputs);
+    for (int i = 0; i < plan.num_inputs && i < static_cast<int>(inputs.size()); ++i) {
+        plan.fixed_table[i] = inputs[i];
+        plan.captured_input_buffers[i] = novatorch::getNovaBuffer(inputs[i]);
+    }
+
+    // 5. Begin recording into the dedicated command buffer
+    //    flags = 0 → reusable (NOT one-time-submit)
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = 0;
+    vkBeginCommandBuffer(plan.dedicated_cmd, &begin);
+
+    // 6. Redirect batch context to capture into our dedicated buffer + UAB pool
+    auto& batch = NovaBatchContext::instance();
+    batch.beginCapture(plan.dedicated_cmd);
+    // Swap in the UAB descriptor pool for capture
+    auto* old_pool = batch.swapDescPool(plan.uab_desc_pool.get());
+
+    // 7. Execute the C++ op loop — records into dedicated_cmd with UAB descriptors
+    for (auto& step : plan.steps) {
+        std::vector<at::Tensor> args;
+        args.reserve(step.input_indices.size());
+        for (int idx : step.input_indices)
+            args.push_back(plan.fixed_table[idx]);
+        plan.fixed_table[step.output_index] = step.op_fn(args);
+    }
+
+    // 8. End capture — retrieve descriptor tracking data
+    plan.descriptor_map = batch.endCaptureWithMap(&plan.captured_retained);
+    batch.swapDescPool(old_pool);  // restore original pool
+
+    // 9. End command buffer recording
+    vkEndCommandBuffer(plan.dedicated_cmd);
+
+    // 10. Submit and wait (first execution)
+    compute.submitToQueue(plan.dedicated_cmd, plan.dedicated_fence);
+    compute.waitForFence(plan.dedicated_fence);
+
+    plan.captured = true;
+
+    // 11. Extract outputs
+    std::vector<at::Tensor> outputs;
+    outputs.reserve(plan.output_indices.size());
+    for (int idx : plan.output_indices) {
+        if (idx >= 0 && idx < static_cast<int>(plan.fixed_table.size()))
+            outputs.push_back(plan.fixed_table[idx]);
+        else
+            outputs.push_back(at::Tensor());
+    }
+    return outputs;
+}
+
+// =========================================================================
+// Replay: rebind changed descriptors, resubmit saved command buffer
+// =========================================================================
+
+static std::vector<at::Tensor> replayPlan(
+    CompiledPlan& plan,
+    const std::vector<at::Tensor>& inputs)
+{
+    auto& compute = NovaContext::instance().compute();
+    VkDevice dev = NovaContext::instance().device();
+
+    // 1. Detect which input VkBuffers changed and rebind descriptors
+    for (int i = 0; i < plan.num_inputs && i < static_cast<int>(inputs.size()); ++i) {
+        VkBuffer new_buf = novatorch::getNovaBuffer(inputs[i]);
+        VkBuffer old_buf = plan.captured_input_buffers[i];
+
+        if (new_buf != old_buf) {
+            // Scan descriptor map: update every binding that references old_buf
+            for (auto& mapping : plan.descriptor_map) {
+                bool set_dirty = false;
+                for (uint32_t b = 0; b < mapping.num_buffers; ++b) {
+                    if (mapping.bound_buffers[b] == old_buf) {
+                        mapping.bound_buffers[b] = new_buf;
+                        set_dirty = true;
+                    }
+                }
+                if (set_dirty) {
+                    // Rebuild buffer infos and update via template
+                    std::vector<VkDescriptorBufferInfo> infos(mapping.num_buffers);
+                    for (uint32_t b = 0; b < mapping.num_buffers; ++b) {
+                        infos[b] = {mapping.bound_buffers[b], 0, mapping.bound_sizes[b]};
+                    }
+                    vkUpdateDescriptorSetWithTemplate(
+                        dev, mapping.set, mapping.pipeline->update_template,
+                        infos.data());
+                }
+            }
+
+            plan.captured_input_buffers[i] = new_buf;
+            plan.fixed_table[i] = inputs[i];
+        }
+    }
+
+    // 2. Wait for previous replay, reset fence
+    vkWaitForFences(dev, 1, &plan.dedicated_fence, VK_TRUE, UINT64_MAX);
+    vkResetFences(dev, 1, &plan.dedicated_fence);
+
+    // 3. Submit the SAME command buffer — descriptors updated in-place
+    compute.submitToQueue(plan.dedicated_cmd, plan.dedicated_fence);
+    compute.waitForFence(plan.dedicated_fence);
+
+    // 4. Extract outputs
+    std::vector<at::Tensor> outputs;
+    outputs.reserve(plan.output_indices.size());
+    for (int idx : plan.output_indices) {
+        if (idx >= 0 && idx < static_cast<int>(plan.fixed_table.size()))
+            outputs.push_back(plan.fixed_table[idx]);
+        else
+            outputs.push_back(at::Tensor());
+    }
+    return outputs;
+}
+
+// =========================================================================
+// Public entry point
 // =========================================================================
 
 std::vector<at::Tensor> executePlan(
     CompiledPlan& plan,
     const std::vector<at::Tensor>& inputs)
 {
-    // Tensor table: [inputs | intermediates computed during execution]
-    std::vector<at::Tensor> table(plan.tensor_table_size);
-
-    // Patch inputs
-    for (int i = 0; i < plan.num_inputs && i < static_cast<int>(inputs.size()); ++i) {
-        table[i] = inputs[i];
+    if (plan.captured) {
+        return replayPlan(plan, inputs);
     }
-
-    // Execute all ops in C++ — no Python in the loop.
-    // Each op calls dispatchCompute() which records into the batch context.
-    for (auto& step : plan.steps) {
-        std::vector<at::Tensor> args;
-        args.reserve(step.input_indices.size());
-        for (int idx : step.input_indices) {
-            args.push_back(table[idx]);
-        }
-        table[step.output_index] = step.op_fn(args);
-    }
-
-    // Single flush — submits entire command buffer, waits for GPU
-    NovaBatchContext::instance().flush();
-
-    // Extract outputs (-1 means None — non-differentiable backward input)
-    std::vector<at::Tensor> outputs;
-    outputs.reserve(plan.output_indices.size());
-    for (int idx : plan.output_indices) {
-        if (idx >= 0 && idx < static_cast<int>(table.size())) {
-            outputs.push_back(table[idx]);
-        } else {
-            outputs.push_back(at::Tensor());  // empty/undefined tensor for None
-        }
-    }
-    return outputs;
+    return capturePlan(plan, inputs);
 }

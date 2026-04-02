@@ -1,47 +1,79 @@
 #pragma once
 
 #include <ATen/ATen.h>
+#include <vulkan/vulkan.h>
+#include "nova_descriptor_pool.h"
+#include "nova_pipeline_cache.h"
+
 #include <functional>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <cstdint>
 
 /// A single step in a compiled execution plan.
-/// Calls a real C++ op function (nova_addmm, nova_relu, etc.) with
-/// tensor arguments resolved from the tensor table.
 struct CompiledStep {
-    /// The op to call. Takes tensor args + scalar args, returns result.
-    /// Pre-bound with any scalar arguments (alpha, beta, etc.) at compile time.
     std::function<at::Tensor(const std::vector<at::Tensor>&)> op_fn;
-
-    /// Indices into the tensor table for this op's inputs.
     std::vector<int> input_indices;
-
-    /// Where to store the result in the tensor table.
     int output_index;
 };
 
-/// A compiled execution plan for an FX graph.
-/// Replays a sequence of C++ op calls entirely in C++ without
-/// returning to Python between ops.
+/// Tracks a descriptor set's buffer bindings for replay updates.
+struct DescriptorMapping {
+    VkDescriptorSet set;
+    const NovaPipelineInfo* pipeline;   // for update_template
+    uint32_t num_buffers;
+    std::vector<VkBuffer> bound_buffers;  // current VkBuffer per binding
+    std::vector<VkDeviceSize> bound_sizes;
+};
+
+/// Compiled execution plan with record-once/replay-many via
+/// UPDATE_AFTER_BIND descriptor sets.
+///
+/// First call: execute C++ ops → record dedicated command buffer → save.
+/// Subsequent calls: rebind changed descriptors → resubmit same command buffer.
 struct CompiledPlan {
     int num_inputs = 0;
     int num_outputs = 0;
-    std::vector<int> output_indices;  // which tensor table slots are outputs
+    std::vector<int> output_indices;
     std::vector<CompiledStep> steps;
     int tensor_table_size = 0;
+
+    // --- Capture/replay state ---
+    bool captured = false;
+
+    // Dedicated Vulkan resources
+    VkCommandPool dedicated_pool = VK_NULL_HANDLE;
+    VkCommandBuffer dedicated_cmd = VK_NULL_HANDLE;
+    VkFence dedicated_fence = VK_NULL_HANDLE;
+
+    // UAB descriptor pool (persistent sets, not reset between replays)
+    std::unique_ptr<NovaDescriptorPool> uab_desc_pool;
+
+    // Descriptor tracking: all descriptor sets and their buffer bindings
+    std::vector<DescriptorMapping> descriptor_map;
+
+    // Input VkBuffer handles from capture (to detect changes on replay)
+    std::vector<VkBuffer> captured_input_buffers;
+
+    // Fixed tensor table from capture (keeps tensors alive)
+    std::vector<at::Tensor> fixed_table;
+
+    // ALL tensors retained during capture — keeps VkBuffers alive for
+    // the command buffer's lifetime. Includes hidden intermediates from
+    // .contiguous(), view materialization, etc. that aren't in fixed_table.
+    std::vector<at::Tensor> captured_retained;
+
+    ~CompiledPlan();
 };
 
-/// Execute a compiled plan with the given input tensors.
-/// Calls C++ ops in sequence, batch context accumulates dispatches,
-/// flushes once at the end. Returns output tensors.
+/// Execute a compiled plan. First call captures; subsequent calls replay.
 std::vector<at::Tensor> executePlan(
     CompiledPlan& plan,
     const std::vector<at::Tensor>& inputs);
 
-/// Add a step to the plan. The op_name is resolved to a C++ function.
-/// scalar_args contains any non-tensor arguments (alpha, beta, dim, etc.)
-/// serialized as doubles.
+/// Add a step to the plan.
 void addPlanStep(
     CompiledPlan& plan,
     const std::string& op_name,
